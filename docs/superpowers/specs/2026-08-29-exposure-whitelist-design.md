@@ -78,11 +78,29 @@ distinguishes nobody. The identifier sets they carry are not generic, and those 
 filtered to exposed namespaces. Default behaviour is therefore: Fabric API works
 normally, and no third-party mod is named anywhere on the wire.
 
-The namespace rule only *seeds* the policy. At first run the live channel set is
-resolved, filtered by the rule, and persisted as an explicit list of channel ids the
-user can review and edit. Namespace is never treated as permanent proof of ownership: a
-third-party mod registering under `minecraft:` appears in that reviewable list rather
-than passing on a heuristic.
+Namespace is never treated as proof of ownership. The rule decides; it does not confer
+trust on a mod because of where it registered. A third-party mod registering under
+`minecraft:` still shows up by name in the reviewable ledger below, where it can be
+withheld explicitly.
+
+### Why the exposed set cannot be pinned at first run
+
+An earlier draft resolved the live channel set once at startup and persisted it as the
+authoritative list of channel ids. That cannot be built. `ClientPlayNetworking`
+`.getGlobalReceivers()` enumerates only channels the client *receives* on, and
+`PayloadTypeRegistry` (verified: `register`, `registerLarge`, and four static accessors,
+no iteration) offers no way to list registered types at all. Every outbound-only channel
+is therefore invisible at startup - including all three leaky Fabric payloads and
+`fabric:registry/sync/complete`, which are precisely the ones worth knowing about.
+
+So the decision mechanism is the namespace rule, evaluated per packet, plus the user's
+explicit overrides. The persisted list becomes a **ledger**: channels observed from
+startup receivers, plus any channel seen on the wire in either direction, recorded with
+its last decision and shown by `/cmdguard exposure`. It grows as it learns.
+
+The ledger being incomplete is safe. Decisions are default-deny, so a channel absent from
+the ledger is withheld, not exposed - the ledger informs the user, it does not gate the
+filter.
 
 ## Architecture
 
@@ -110,22 +128,54 @@ channels whether or not you advertised them.
 | Payload | Action |
 | --- | --- |
 | `minecraft:brand` | Pass through untouched, always. Hardcoded, not policy-driven. |
+| `c:version` | Pass through. Protocol version negotiation; carries no mod data. |
 | `minecraft:register`, `minecraft:unregister`, `c:register` | Rewrite. Channel list filtered to exposed channels. Entries removed, never added. |
 | Leaky Fabric payloads carrying `Set<Identifier>` | Rewrite. Identifier set filtered to exposed namespaces. |
 | Anything else | Pass or drop per policy. A dropped payload is silence; nothing is sent in its place. |
+
+`minecraft:unregister` is filtered for the same reason as `register`, which is easy to
+miss: unregistering a channel names it. A client that never advertised `somemod:handshake`
+and then unregisters it has disclosed `somemod` just as surely as advertising it would.
+
+### Rewriting a payload
+
+This is the hardest part of the implementation and the earlier draft skipped it.
+
+At `Connection#send` the payload is already a typed Fabric record, not bytes, and
+depending on Fabric's internal record types is what `RawPayload` exists to avoid. The
+route: serialize the outgoing payload through its own codec into a `FriendlyByteBuf`,
+apply the filter at byte level, and re-wrap the result as a `RawPayload` carrying the
+same channel id. Fabric's types are never named or imported.
+
+Byte-level filtering needs the wire layout preceding the identifier collection. All five
+rewritable channels, read from source:
+
+| Channel | Prefix before the collection |
+| --- | --- |
+| `minecraft:register`, `minecraft:unregister` | none - NUL-separated ASCII, whole body |
+| `c:register` | varint version, UTF phase |
+| `fabric:accepted_attachments_v1` | none |
+| `fabric:recipe_sync/supported_serializers` | none |
+| `fabric:custom_ingredient_sync` | varint protocolVersion |
+
+Collections are a varint count followed by that many identifiers. A channel with no entry
+in this table is never rewritten - only passed or dropped - so an unrecognised wire format
+cannot corrupt a packet.
 
 ### Components
 
 Pure, no Minecraft imports, unit-testable without a client:
 
-- `ExposurePolicy` - `decide(channelId, serverKey)` returns `EXPOSE` or `WITHHOLD`. Holds the
-  pinned channel list and the user's additions. Any throw is caught and treated as
-  `WITHHOLD`.
-- `RegistrationFilter` - filters `minecraft:register` bodies (NUL-separated ASCII) and
-  `c:register` bodies (varint version, UTF phase, identifier collection). Bytes in,
-  bytes out.
-- `IdentifierSetFilter` - filters the `Set<Identifier>` in the three leaky Fabric
-  payloads down to exposed namespaces.
+- `ExposurePolicy` - immutable. `decide(channelId, serverKey)` returns `EXPOSE` or
+  `WITHHOLD` from the exposed-namespace set, the per-server grants, and the channel-level
+  refinements. Any throw is caught and treated as `WITHHOLD`.
+- `RegistrationFilter` - filters `minecraft:register` and `minecraft:unregister` bodies
+  (NUL-separated ASCII). Bytes in, bytes out.
+- `IdentifierSetFilter` - filters a varint-counted identifier collection behind a known
+  prefix, per the wire-layout table above. Covers `c:register` and the three leaky Fabric
+  payloads; the prefix is copied through untouched.
+- `ChannelLedger` - the record of channels observed and their last decision. Persisted,
+  read by `/cmdguard exposure`, and never consulted by the filter.
 
 Minecraft-facing, kept thin:
 
@@ -133,15 +183,32 @@ Minecraft-facing, kept thin:
   out as plain bytes, with no dependency on Fabric's internal payload types, which would
   break on every Fabric API bump.
 - `ExposureGuard` - the facade the mixins call. Returns the packet, a rewritten packet,
-  or null to cancel. Owns the session counters.
+  or null to cancel. Holds the connection's policy snapshot and feeds the ledger.
 - `ConnectionMixin`, plus inbound handling on the existing `ClientPacketListenerMixin`.
 
 ### Per-server policy
 
-Global policy plus a `Map<serverAddress, Set<channel>>` of additional exposures, keyed
-on `ServerData#ip` lowercased, with `singleplayer` and `lan` as reserved keys.
-`/cmdguard expose <channel>` applies to the current server; `--global` applies
-everywhere.
+Global policy plus a `Map<serverAddress, Set<String>>` of additional exposures, keyed on
+`ServerData#ip` lowercased, with `singleplayer` and `lan` as reserved keys.
+
+Exposures are granted **by namespace**, matching the rule: `/cmdguard expose <namespace>`
+applies to the current server, `--global` applies everywhere. A mod typically registers
+several channels, so channel-by-channel granting would be whack-a-mole. Channel-level
+refinement exists for the case where one channel of an exposed mod should stay withheld:
+`/cmdguard expose channel <id>` and `/cmdguard withhold channel <id>`, the latter taking
+precedence over a namespace grant.
+
+### Policy lifecycle
+
+`ExposurePolicy` is immutable. Editing config builds a new instance and swaps it
+atomically.
+
+A connection captures its policy snapshot when it opens and uses that snapshot for its
+lifetime. `Connection#send` runs on the netty event loop rather than the client thread,
+so the policy must be safe to read from another thread, and a config edit made
+mid-session must not change behaviour halfway through a handshake - the configuration
+phase would otherwise be filtered under one policy and the play phase under another.
+Changes take effect on the next connection, and `/cmdguard expose` says so.
 
 ## The invariant
 
@@ -162,9 +229,18 @@ Fail closed, and never fail silently.
   Loom cache - so this is the mechanism that catches a wrong guess.
 - A throw inside the policy withholds.
 - Join-time chat line reports the counts: exposed, withheld.
-- `/cmdguard exposure` lists every registered channel as EXPOSED or WITHHELD with the
-  session's withheld-payload count. `fabric:registry/sync/complete` is listed as always
-  exposed, annotated: required to finish joining, carries no data.
+- `/cmdguard exposure` lists every channel in the ledger as EXPOSED or WITHHELD with the
+  withheld-payload count, and survives a disconnect so it can be read after a kick.
+  `fabric:registry/sync/complete` is listed as always exposed, annotated: required to
+  finish joining, carries no data.
+
+## Config migration
+
+`cmdguard.json` already exists on disk for current users and has none of the new fields.
+Gson leaves absent fields null, so every new field needs the same null guard the loader
+already applies to `allowlist`. First-run seeding must populate only what is missing and
+must never overwrite an existing file's settings. Getting this wrong silently resets a
+user's command allowlist, which is the one piece of state they have curated by hand.
 
 ## Known costs
 
@@ -172,6 +248,15 @@ An identifier you withhold is one the server will not sync to you. Withheld atta
 types, recipe serializers and custom ingredients degrade the mods that own them. That is
 the trade being bought, and it is coherent: you declined to participate rather than
 misreported.
+
+**You will be kicked from servers that require a client mod you are withholding.** A
+server enforcing a required-mod check sees a client without that channel and refuses the
+connection, which is the correct outcome for both sides: it asked, and you declined to
+answer, so it declines to host you. The remedy is `/cmdguard expose <namespace>` for that
+server followed by a reconnect. This is the most common way a user will meet the feature,
+and a kick leaves no chat to write to - so the withheld set for a connection must survive
+its disconnect, be logged, and be readable afterwards via `/cmdguard exposure` so the
+user can see what was withheld rather than guess.
 
 ## Documentation changes
 
@@ -201,6 +286,23 @@ invariant.
 
 Not covered: mixins and Minecraft-facing code. There is no Minecraft client on the build
 machine. This is a real gap, stated rather than papered over.
+
+### Manual acceptance, on a machine with a client
+
+Unit tests cannot show that the interception point is correct. The following is the
+minimum that must be run once by hand before this is called done:
+
+1. Join a vanilla server. Connects normally; `minecraft:brand` still reads `fabric`.
+2. Join a Fabric server running mods, with third-party client mods installed. Connection
+   completes - no hang in the configuration phase, which is what a wrongly withheld
+   `fabric:registry/sync/complete` would cause.
+3. `/cmdguard exposure` lists withheld channels and a non-zero withheld count.
+4. `/cmdguard expose <namespace>` for one withheld mod, reconnect, confirm the count drops
+   and that namespace now reads EXPOSED.
+5. Confirm the command guard and `/cmdguard audit` still behave as before.
+
+A packet capture of the configuration phase, if the tester can take one, is the only
+direct evidence that no withheld identifier reached the wire.
 
 ## Out of scope
 
