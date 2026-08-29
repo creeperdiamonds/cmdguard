@@ -206,9 +206,14 @@ Minecraft-facing, kept thin:
   and returns a filtered instance of the same record, or the original unchanged when it
   matches none. The only file that imports Fabric `impl` types, so the unstable surface
   sits in one place.
-- `ExposureGuard` - the facade the mixins call. Returns the packet, a rewritten packet,
-  or null to cancel. Holds the connection's policy snapshot and feeds the ledger.
-- `ConnectionMixin`, plus inbound handling on the existing `ClientPacketListenerMixin`.
+- `ExposureGuard` - the facade the mixins call: `shouldDrop`/`allowInbound` return booleans,
+  `rewriteOrSame`/`filterBundle` return the packet unchanged or a rewritten/rebuilt one --
+  never null, there is nothing here to cancel a packet by returning null. Holds the
+  connection's policy snapshot and feeds the ledger.
+- `ConnectionMixin` - both directions, outbound and inbound, the latter including the
+  packet-bundle unwrapping `filterBundle` needs (see `NOTES.md`, "Inbound: packet bundles").
+  `ClientPacketListenerMixin` is unrelated to exposure: it holds the outbound
+  `sendCommand`/`sendUnattendedCommand` guard from the command-blocking feature.
 
 ### Per-server policy
 

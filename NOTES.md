@@ -429,19 +429,27 @@ net.minecraft.network.ProtocolInfo
 ```
 
 **An emptied bundle is emitted, not cancelled, and that is safe.** Read, not assumed: a
-grep of the decompiled sources finds exactly two callers of `subPackets()` —
+grep of the decompiled *base game* sources finds two callers of `subPackets()` —
 `handleBundlePacket` above, whose body is a bare for-each, and `BundlerInfo.unbundlePacket`,
-which is the *server's* outbound path and is unreachable here. An empty bundle therefore
-runs the loop zero times and is completely inert. Nothing asserts a non-empty bundle.
-Emitting it keeps the decision in one place and leaves `receivedPackets` honest.
+which is the *server's* outbound path and is unreachable here. Fabric API adds a third at
+runtime (see below), and this mod hard-depends on Fabric API, so the base-game count alone
+is not the full picture — the conclusion below still holds, but on all three, not two.
+An empty bundle runs each of them zero times and is completely inert. Nothing asserts a
+non-empty bundle. Emitting it keeps the decision in one place and leaves `receivedPackets`
+honest.
 
 **Fabric API 0.141.6 does touch bundles, and it helps rather than conflicts.**
 `net.fabricmc.fabric.mixin.networking.BundlePacketMixin` is a `@ModifyVariable` on
 `BundlePacket.<init>`'s `Iterable` argument that flattens nested bundles into a fresh
-`ArrayList`. Consequences, both benign: `subPackets()` is always a re-iterable `ArrayList`,
+`ArrayList` — read against the decompiled source, its private `iterateBundle` helper calls
+`subPackets()` on every nested `BundlePacket` it finds, recursively, to inline them. That
+is the third caller the paragraph above accounts for: not reachable from the base game
+alone, but reachable in the actual running mod, since Fabric API is a hard dependency.
+Consequences, both benign: `subPackets()` is always a re-iterable `ArrayList`,
 and the `ClientboundBundlePacket` this mod constructs goes through that same flattening
-(a no-op copy of an already-flat, already-filtered list). Fabric's `ConnectionMixin` still
-touches no inbound handler — re-checked here: `<init>`, `sendPacket`, `validateListener`,
+(a no-op copy of an already-flat, already-filtered list, since it holds no nested bundles).
+Fabric's `ConnectionMixin` still touches no inbound handler — re-checked here: `<init>`,
+`sendPacket`, `validateListener`,
 `channelInactive`, `handleDisconnection`, `setupInboundProtocol`, `setupOutboundProtocol`.
 
 **Not verified in game.** Nothing in this project has ever run in Minecraft. This is a

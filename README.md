@@ -119,10 +119,11 @@ instead of just that one connection. This covers more than ordinary multiplayer:
   recipe-serializer and custom-ingredient messages your client sends to *your own* server,
   breaking other mods' networking, attachment sync and custom recipes to buy no privacy
   whatsoever. So exposure filtering is off for singleplayer, and `/cmdguard exposure` says
-  so. The connection still gets its own reserved `"singleplayer"` key so per-world grants
-  stay separate from any real server's. This applies while hosting with "Open to LAN" too;
-  *joining* someone else's LAN game is an ordinary server connection and is filtered
-  normally.
+  so. The connection still gets its own reserved `"singleplayer"` key, kept separate from
+  any real server's, but since filtering is off entirely here that key does nothing —
+  any `expose`/`withhold` recorded against it is stored and never applied to anything. This
+  applies while hosting with "Open to LAN" too; *joining* someone else's LAN game is an
+  ordinary server connection and is filtered normally.
 - **Realms, quick-play, and joining a LAN game from the "LAN Games" list are all fully
   covered.** Each of these carries a real, correctly-addressed server identity into the
   connection — a Realms join, a quick-play join, and a LAN join all end up passing a
