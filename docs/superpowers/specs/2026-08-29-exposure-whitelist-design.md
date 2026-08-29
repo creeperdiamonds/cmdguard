@@ -195,7 +195,13 @@ Minecraft-facing, kept thin:
 ### Per-server policy
 
 Global policy plus a `Map<serverAddress, Set<String>>` of additional exposures, keyed on
-`ServerData#ip` lowercased, with `singleplayer` and `lan` as reserved keys.
+`ServerData#ip` lowercased, with `singleplayer` as the one reserved key.
+
+An earlier draft of this spec also reserved `lan`. That turned out to be wrong, and the
+implementation is right: a LAN join carries the real discovered LAN address through the
+listener cookie, so it is keyed like any other server and gets its own grants. Only a
+connection with no `ServerData` at all falls back to `singleplayer`. Per-world grants
+therefore work in singleplayer and stay separate from every real server's.
 
 Exposures are granted **by namespace**, matching the rule: `/cmdguard expose <namespace>`
 applies to the current server, `--global` applies everywhere. A mod typically registers
