@@ -430,7 +430,7 @@ public final class ExposureGuard {
     }
 
     /**
-     * One INFO line the first time a channel is withheld on a connection, in each direction.
+     * One INFO line the first time a channel is withheld on a connection.
      *
      * <p>Nothing about a withheld payload used to be logged anywhere, which made a working
      * filter and a filter that never ran indistinguishable from the outside -- the exact
@@ -440,9 +440,11 @@ public final class ExposureGuard {
      * a kick leaves no chat to write to. {@code latest.log} is the one surface that survives
      * it.
      *
-     * <p>Once per channel per direction, not once per payload: a chatty channel would
-     * otherwise flood the log, and the repeat count is already in the ledger and in
-     * {@code /cmdguard exposure}.
+     * <p>Once per channel, not once per payload: a chatty channel would otherwise flood the
+     * log, and the repeat count is already in the ledger and in {@code /cmdguard exposure}.
+     * The ledger keys on the channel alone, so a channel withheld in both directions is
+     * logged once, under whichever direction hit it first -- the {@code direction} word says
+     * which that was, and is not a promise of one line per direction.
      */
     private static void logFirstWithhold(String direction, String channel, Snapshot snapshot) {
         CmdGuardClient.LOGGER.info(
