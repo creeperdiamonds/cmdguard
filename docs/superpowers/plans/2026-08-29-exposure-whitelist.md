@@ -1534,6 +1534,11 @@ Add a README section titled `Exposure whitelist`. It must state, in plain words:
 - What is not hidden: `minecraft:brand` still reads `fabric`, Fabric API's channels are still advertised, and a server can still tell you are modded and roughly on what Fabric API version. This reduces mod-inventory disclosure; it does not make you look unmodded.
 - That withholding degrades the mods you withheld, because the server will not sync what you declined to accept.
 - That a server requiring a client mod you are withholding will kick you, and that `/cmdguard expose <namespace>` plus a reconnect is the fix.
+- That grants are per server address and are frozen when the connection opens, so `/cmdguard expose` takes effect on your next connection, not the current one.
+- Where per-server grants do **not** apply, and what happens instead. Be accurate here — an earlier draft of this plan overstated the gaps, and they shrank as the implementation went in:
+  - Singleplayer has no server address, so only global grants apply. That is definitional, not a limitation.
+  - A server transfer deliberately falls back to global grants only, rather than carrying the origin server's grants to the destination. Stricter on purpose.
+  - Realms and quick-play joins **are** covered — both carry a real server identity through to the connection. Do not list them as limitations.
 
 - [ ] **Step 5: Build and run the full test suite**
 
