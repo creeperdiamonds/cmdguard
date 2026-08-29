@@ -13,7 +13,6 @@ import net.minecraft.resources.Identifier;
 import studios.creeperdiamonds.cmdguard.CmdGuardClient;
 import studios.creeperdiamonds.cmdguard.GuardConfig;
 
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -414,6 +413,20 @@ public final class ExposureGuard {
 
     /** False when an inbound payload on this channel must not reach the mod that owns it. */
     public static boolean allowInbound(Identifier channel, Snapshot snapshot) {
+        return allowInbound(channel, snapshot, "inbound");
+    }
+
+    /**
+     * {@link #allowInbound(Identifier, Snapshot)}, with the log line's {@code direction} word
+     * overridable so a payload found inside a bundle logs distinguishably from a bare one.
+     *
+     * <p>Without this, {@link #filterBundle}'s path and the bare {@code channelRead0} path
+     * produced the exact same log line, so a real session could never tell whether the
+     * bundle filter had fired at all -- the same blind spot that let the bundle filter's
+     * predecessor (the inbound mixin-ordering defect) ship unnoticed. {@code direction} is
+     * otherwise opaque to this method: it only ever reaches {@link #logFirstWithhold}.
+     */
+    private static boolean allowInbound(Identifier channel, Snapshot snapshot, String direction) {
         if (!snapshot.active() || !snapshot.filterInbound()) {
             return true;
         }
@@ -421,7 +434,7 @@ public final class ExposureGuard {
             String id = channel.toString();
             boolean exposed = snapshot.policy().isExposed(id);
             if (!exposed && LEDGER.record(id, false)) {
-                logFirstWithhold("inbound", id, snapshot);
+                logFirstWithhold(direction, id, snapshot);
             }
             return exposed;
         } catch (RuntimeException e) {
@@ -457,19 +470,25 @@ public final class ExposureGuard {
      * <p><b>Removal only, and only of custom payloads.</b> Bundles are how vanilla batches
      * entity spawn traffic, so dropping an arbitrary sub-packet would break the game and
      * dropping the whole bundle would take unrelated packets with it. Nothing is ever added
-     * or altered here -- {@link ClientboundBundlePacket} is rebuilt from a list that is a
-     * subset of its own sub-packets, in the original order. That keeps this inside the same
+     * or altered here -- the walk-drop-preserve-order-defer-allocation logic itself lives in
+     * {@link BundleFilter#retainAllowed}, unit-tested there with plain strings; this method
+     * only supplies the drop predicate and rebuilds {@link ClientboundBundlePacket} from
+     * whatever subset comes back, in the original order. That keeps this inside the same
      * no-fabrication rule as {@link IdentifierFilter}: withholding is silence.
      *
      * <p><b>An emptied bundle is emitted, not cancelled, and that is safe.</b> Read, not
-     * assumed: {@code subPackets()} has exactly two callers in the game (verified by
-     * grepping the decompiled sources) -- {@code ClientPacketListener#handleBundlePacket},
-     * whose body is {@code ensureRunningOnSameThread} followed by a bare for-each, and
-     * {@code BundlerInfo.unbundlePacket}, which is the server's outbound path and is never
-     * reached here. An empty bundle therefore runs the for-each zero times and does nothing
-     * at all; no code path asserts a non-empty bundle. Emitting it rather than cancelling
-     * keeps the decision in one place and leaves {@code Connection}'s {@code receivedPackets}
-     * counter honest.
+     * assumed: a grep of the decompiled sources finds two callers of {@code subPackets()} in
+     * the base game -- {@code ClientPacketListener#handleBundlePacket}, whose body is
+     * {@code ensureRunningOnSameThread} followed by a bare for-each, and {@code
+     * BundlerInfo.unbundlePacket}, which is the server's outbound path and is never reached
+     * here. Fabric API 0.141.6 adds a third at runtime -- {@code BundlePacketMixin}, which
+     * reads a bundle's sub-packets to flatten nested bundles at construction time -- and this
+     * mod hard-depends on Fabric API, so it is never truly absent from the running game. The
+     * conclusion is unaffected: that mixin's body is also a bare copy into a fresh {@code
+     * ArrayList}, so it too runs zero times, and does nothing else, on an empty bundle. An
+     * empty bundle therefore does nothing at all in any of the three; no code path asserts a
+     * non-empty bundle. Emitting it rather than cancelling keeps the decision in one place
+     * and leaves {@code Connection}'s {@code receivedPackets} counter honest.
      *
      * <p><b>Fail closed.</b> A sub-packet whose channel id cannot even be read is withheld
      * rather than kept (see {@link #allowBundledPayload}), and {@link #allowInbound} already
@@ -488,17 +507,11 @@ public final class ExposureGuard {
             return bundle;
         }
         try {
-            List<Packet<? super ClientGamePacketListener>> kept = new ArrayList<>();
-            boolean removed = false;
-            for (Packet<? super ClientGamePacketListener> sub : bundle.subPackets()) {
-                if (sub instanceof ClientboundCustomPayloadPacket custom
-                        && !allowBundledPayload(custom, snapshot)) {
-                    removed = true;
-                    continue;
-                }
-                kept.add(sub);
-            }
-            return removed ? new ClientboundBundlePacket(kept) : bundle;
+            List<Packet<? super ClientGamePacketListener>> kept = BundleFilter.retainAllowed(
+                    bundle.subPackets(),
+                    sub -> sub instanceof ClientboundCustomPayloadPacket custom
+                            && !allowBundledPayload(custom, snapshot));
+            return kept == null ? bundle : new ClientboundBundlePacket(kept);
         } catch (RuntimeException e) {
             CmdGuardClient.LOGGER.error(
                     "[cmdguard] bundle filter failed; refusing to deliver an unfiltered bundle", e);
@@ -525,7 +538,7 @@ public final class ExposureGuard {
                     "[cmdguard] could not read a bundled payload's channel, withholding it", e);
             return false;
         }
-        return allowInbound(channel, snapshot);
+        return allowInbound(channel, snapshot, "inbound (bundled)");
     }
 
     private static String channelOf(ServerboundCustomPayloadPacket packet) {
