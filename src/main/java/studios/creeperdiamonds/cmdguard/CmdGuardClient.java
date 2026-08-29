@@ -48,6 +48,11 @@ public final class CmdGuardClient implements ClientModInitializer {
         ExposureGuard.Snapshot snapshot = ExposureGuard.currentSnapshot();
 
         if (snapshot != null && !snapshot.active()) {
+            if (ExposureGuard.SINGLEPLAYER_KEY.equals(snapshot.serverKey())) {
+                // Not a warning: a local world talks to its own in-process server, so there
+                // is nobody to withhold anything from.
+                return;
+            }
             OutboundGuard.say(Component.literal("CmdGuard exposure filtering is ")
                     .withStyle(ChatFormatting.GOLD)
                     .append(Component.literal("OFF").withStyle(ChatFormatting.RED))

@@ -95,6 +95,18 @@ public final class CmdGuardCommands {
         return 1;
     }
 
+    /** Why filtering is off for the connection this snapshot belongs to. */
+    private static String exposureOffReason(ExposureGuard.Snapshot snapshot) {
+        if (ExposureGuard.SINGLEPLAYER_KEY.equals(snapshot.serverKey())) {
+            return ": singleplayer is exempt, because your client is talking to its own "
+                    + "integrated server in this same process and there is nobody to withhold from.";
+        }
+        if (GuardConfig.get().exposure.enabled) {
+            return ", because /cmdguard off disables the exposure layer too.";
+        }
+        return ".";
+    }
+
     /** The parenthetical that says <em>why</em> exposure filtering is in the state it is. */
     private static String exposureQualifier(GuardConfig config) {
         if (!config.exposure.enabled) {
@@ -164,9 +176,7 @@ public final class CmdGuardCommands {
                     .withStyle(ChatFormatting.GOLD)
                     .append(Component.literal("OFF").withStyle(ChatFormatting.RED))
                     .append(Component.literal(" for this connection -- nothing below was withheld"
-                                    + (GuardConfig.get().exposure.enabled
-                                    ? ", because /cmdguard off disables the exposure layer too."
-                                    : "."))
+                                    + exposureOffReason(connectionSnapshot))
                             .withStyle(ChatFormatting.GRAY)));
         }
 

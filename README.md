@@ -99,11 +99,17 @@ connection, not the one you're on.
 carries, plus `/cmdguard expose global <namespace>` to allow a namespace everywhere
 instead of just that one connection. This covers more than ordinary multiplayer:
 
-- **Singleplayer gets its own grants too.** A singleplayer connection has no real
-  server address, so it is keyed on the literal string `"singleplayer"` instead. This
-  is not a limitation: `/cmdguard expose <namespace>` works normally while playing a
-  world you host (with or without "Open to LAN"), and the grant is stored under that
-  reserved key, kept separate from any real server's grants.
+- **Singleplayer is not filtered at all.** A local world's connection runs between your
+  client and the integrated server inside the same process. There is no remote party, so
+  there is nothing to withhold from — and filtering it is not free: it would strip
+  third-party identifiers out of `minecraft:register`, `c:register`, accepted-attachments,
+  recipe-serializer and custom-ingredient messages your client sends to *your own* server,
+  breaking other mods' networking, attachment sync and custom recipes to buy no privacy
+  whatsoever. So exposure filtering is off for singleplayer, and `/cmdguard exposure` says
+  so. The connection still gets its own reserved `"singleplayer"` key so per-world grants
+  stay separate from any real server's. This applies while hosting with "Open to LAN" too;
+  *joining* someone else's LAN game is an ordinary server connection and is filtered
+  normally.
 - **Realms, quick-play, and joining a LAN game from the "LAN Games" list are all fully
   covered.** Each of these carries a real, correctly-addressed server identity into the
   connection — a Realms join, a quick-play join, and a LAN join all end up passing a

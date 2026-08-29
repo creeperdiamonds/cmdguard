@@ -34,6 +34,16 @@ import java.util.concurrent.atomic.AtomicBoolean;
  */
 public final class ExposureGuard {
 
+    /**
+     * The reserved server key for a connection with no {@code ServerData} -- a local world's
+     * client-to-integrated-server connection.
+     *
+     * <p>The key is deliberately kept even though {@link #snapshotFor} switches filtering off
+     * for it: the spec's per-world grant separation is built on this key existing and staying
+     * distinct from every real server's. Only {@code active} changes.
+     */
+    public static final String SINGLEPLAYER_KEY = "singleplayer";
+
     /** Every set empty: nothing but {@code ExposurePolicy.NEVER_WITHHELD} gets through. */
     private static final ExposurePolicy DENY_ALL = new ExposurePolicy(Set.of(), Set.of(), Set.of());
 
@@ -268,11 +278,27 @@ public final class ExposureGuard {
                 counts.exposed(), counts.withheld(), counts.withheldPayloads());
     }
 
-    /** Builds the full per-connection snapshot, including this server's own grants. */
+    /**
+     * Builds the full per-connection snapshot, including this server's own grants.
+     *
+     * <p><b>Singleplayer is exempt.</b> A local world's connection runs between the client
+     * and the integrated server in the same JVM: there is no remote party, so there is no
+     * disclosure to control. Filtering it bought nothing and cost real function --
+     * {@code minecraft:register}, {@code c:register}, accepted-attachments, recipe
+     * serializers and custom ingredients all had third-party identifiers stripped while
+     * talking to the player's own process, degrading other mods' networking, attachment sync
+     * and custom recipes for no privacy gain whatsoever. So {@code active} is false for
+     * {@link #SINGLEPLAYER_KEY}.
+     *
+     * <p>The key itself stays: per-world grants are keyed on it and must stay separate from
+     * every real server's, and "Open to LAN" does not change the key (a LAN <em>host</em>
+     * is still this same in-process connection; a LAN <em>join</em> carries a real
+     * {@code ServerData} and gets a real key, so it is filtered like any other server).
+     */
     public static Snapshot snapshotFor(String serverKey) {
         GuardConfig config = GuardConfig.get();
         return new Snapshot(
-                config.exposureActive(),
+                config.exposureActive() && !SINGLEPLAYER_KEY.equals(serverKey),
                 config.exposure.filterInbound,
                 config.exposure.policyFor(serverKey),
                 serverKey);

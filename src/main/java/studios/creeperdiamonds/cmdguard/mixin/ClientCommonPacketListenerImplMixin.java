@@ -93,7 +93,7 @@ public abstract class ClientCommonPacketListenerImplMixin {
                                          CommonListenerCookie commonListenerCookie, CallbackInfo ci) {
         ServerData serverData = commonListenerCookie.serverData();
         String serverKey = serverData == null || serverData.ip == null
-                ? "singleplayer"
+                ? ExposureGuard.SINGLEPLAYER_KEY
                 : serverData.ip.toLowerCase(Locale.ROOT);
         ExposureGuard.beginConnection(this.connection, serverKey);
     }
