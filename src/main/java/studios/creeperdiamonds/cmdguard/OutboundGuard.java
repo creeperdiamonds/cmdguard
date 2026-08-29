@@ -8,8 +8,8 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
 
+import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * The decision: does this command leave the machine?
@@ -22,13 +22,27 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class OutboundGuard {
 
     /**
-     * Roots whose first withheld completion request has already been logged.
+     * Roots whose withheld completion requests have already been reported, kept pairwise
+     * prefix-incomparable: a root is only added when no entry is a prefix of it and it is a
+     * prefix of no entry. See {@link #logFirstSuggestionBlock} for why that is the bound.
      *
-     * <p>Concurrent because {@link #shouldBlockSuggestion} is reached from {@code
-     * Connection#sendPacket}, which provably runs on both the client thread and the netty
-     * event loop.
+     * <p>Guarded by its own monitor rather than being a concurrent set, because the check is
+     * now check-then-act over the <em>whole</em> set -- {@link #shouldBlockSuggestion} is
+     * reached from {@code Connection#sendPacket}, which provably runs on both the client
+     * thread and the netty event loop, and an unsynchronised scan-then-add there would let two
+     * threads both decide to log the same root. Every read and every write of this set and of
+     * {@link #reportedRootlessRequest} happens inside {@code synchronized (
+     * REPORTED_SUGGESTION_ROOTS)}; the log call itself is deliberately outside it, so nothing
+     * holds a lock across an appender.
+     *
+     * <p>The empty root is never put in here. It is a prefix of every string, so one rootless
+     * request would suppress every later line; {@link #reportedRootlessRequest} tracks it
+     * separately instead.
      */
-    private static final Set<String> REPORTED_SUGGESTION_ROOTS = ConcurrentHashMap.newKeySet();
+    private static final Set<String> REPORTED_SUGGESTION_ROOTS = new HashSet<>();
+
+    /** Whether the one line about a rootless request has been emitted. Guarded as above. */
+    private static boolean reportedRootlessRequest;
 
     private OutboundGuard() {
     }
@@ -92,24 +106,53 @@ public final class OutboundGuard {
     }
 
     /**
-     * One INFO line the first time completions are withheld for a given root.
+     * One INFO line the first time completions are withheld for a root, where "a root" is
+     * taken up to prefixes: a root is reported only when no already-reported root is a prefix
+     * of it and it is a prefix of no already-reported root.
      *
-     * <p>Once per root rather than once per request, because a request goes out per keystroke
-     * and the same root repeats for every character of its arguments. The set is never
-     * cleared: it bounds the log to the distinct roots typed in a session, which is what makes
-     * it safe to leave at INFO, and a repeat line after a reconnect would add nothing the
-     * first one did not already say.
+     * <p><b>Why prefixes, and not simply once per distinct root.</b> The plain per-root dedupe
+     * this replaced was justified on the grounds that "a request goes out per keystroke and
+     * the same root repeats for every character of its arguments" -- which is true only while
+     * the root is stable, i.e. in the ordinary case where the server hangs its {@code
+     * ASK_SERVER} node on an <em>argument</em>. The case this guard exists for is the other
+     * one: a server that hangs {@code ASK_SERVER} directly under the root harvests keystrokes,
+     * and there the root grows by one character per keystroke. Typing {@code /somemod:debug}
+     * then produced fourteen INFO lines -- {@code s}, {@code so}, {@code som}, {@code some},
+     * ... -- each carrying the full explanatory sentence, reconstructing the typed command
+     * name character by character in {@code latest.log}. Nothing reached the server and no
+     * argument was ever logged, but the stated bound was not the real bound, and a guard
+     * writing the very keystrokes it withheld into a file is not a detail to leave standing.
      *
-     * <p>It exists for the same reason the exposure layer's withhold lines do -- a silent
-     * filter and a filter that never ran look identical from the outside, and that is exactly
-     * how the inbound filter's mixin-ordering defect survived. Here the user-visible symptom
-     * is only "tab does nothing", which is far too quiet to diagnose on its own.
+     * <p>Prefix dedupe was chosen over the other candidate -- keep the first line at INFO and
+     * drop later ones to DEBUG -- because it bounds the log <em>structurally</em>, at every
+     * log level. DEBUG lines are merely hidden by the default log4j configuration; a user
+     * running with debug logging on, which is exactly what someone diagnosing a mod does,
+     * would get the whole character-by-character reconstruction back. This instead never
+     * writes the later lines at all, and it keeps a per-command INFO line in the ordinary
+     * case, where the first root seen is already the complete one ({@code /somemod:debug
+     * <Tab>} on an argument reports {@code somemod:debug}, exactly as before).
+     *
+     * <p>The first occurrence is still INFO, and that is the point: a silent filter and a
+     * filter that never ran look identical from the outside, which is how the inbound
+     * filter's mixin-ordering defect survived. Here the only user-visible symptom is "tab does
+     * nothing", far too quiet to diagnose on its own. The cost of the prefix rule is that a
+     * genuinely distinct root which happens to extend a reported one ({@code banip} after
+     * {@code ban}) is not reported separately; one visible line per session per command
+     * <em>family</em> is enough to answer "did the guard fire", and the config screen's toggle
+     * is where the rest of the answer is.
+     *
+     * <p>Nothing is ever cleared. The set is bounded by the pairwise prefix-incomparable roots
+     * typed in a session -- exactly one, in the keystroke-harvest case above -- and a repeat
+     * line after a reconnect would add nothing the first one did not already say.
      */
     private static void logFirstSuggestionBlock(String root) {
-        if (!REPORTED_SUGGESTION_ROOTS.add(root)) {
-            return;
-        }
         if (root.isEmpty()) {
+            synchronized (REPORTED_SUGGESTION_ROOTS) {
+                if (reportedRootlessRequest) {
+                    return;
+                }
+                reportedRootlessRequest = true;
+            }
             CmdGuardClient.LOGGER.info(
                     "[cmdguard] withheld a tab-completion request with no command root yet"
                             + " (\"/\" on its own, or an empty command box). Repeats are not"
@@ -117,13 +160,52 @@ public final class OutboundGuard {
                             + " of the command tree, so this costs you nothing.");
             return;
         }
+        if (!recordSuggestionRoot(root)) {
+            return;
+        }
         CmdGuardClient.LOGGER.info(
                 "[cmdguard] withheld the tab-completion request for \"{}\" -- that root is not on"
                         + " your allowlist, and a completion request puts the partial command on"
-                        + " the wire just as running it would. Repeats are not logged. Run"
-                        + " \"/cmdguard allow {}\" to allow both, or switch the suggestion guard"
-                        + " off in the config screen.",
-                root, root);
+                        + " the wire just as running it would. Neither this root nor any longer"
+                        + " one starting with it is logged again, so if you were still mid-word"
+                        + " this names only what you had typed at the time. Run \"/cmdguard allow"
+                        + " <root>\" with the whole command root to allow it and its completions,"
+                        + " or switch the suggestion guard off in the config screen.",
+                root);
+    }
+
+    /**
+     * Adds {@code root} to {@link #REPORTED_SUGGESTION_ROOTS} and returns true, unless it is
+     * prefix-comparable with something already there -- in which case nothing is added and it
+     * returns false.
+     *
+     * <p>Both directions are checked. A reported root that is a prefix of this one is the
+     * keystroke-by-keystroke case ({@code s} then {@code so}); this one being a prefix of a
+     * reported root is the same typing done in the other order, after a backspace or a
+     * retype. Not adding in the second case is deliberate: the entries that survive are the
+     * shortest of each family, which is what keeps the set from growing along one command.
+     *
+     * <p>Package-private so {@code OutboundGuardSuggestionLogTest} can drive the dedupe
+     * without a game client. {@link #resetSuggestionLogForTest()} is there for the same
+     * reason; nothing in the mod calls either.
+     */
+    static boolean recordSuggestionRoot(String root) {
+        synchronized (REPORTED_SUGGESTION_ROOTS) {
+            for (String reported : REPORTED_SUGGESTION_ROOTS) {
+                if (root.startsWith(reported) || reported.startsWith(root)) {
+                    return false;
+                }
+            }
+            return REPORTED_SUGGESTION_ROOTS.add(root);
+        }
+    }
+
+    /** Clears the reported-root state. Tests only; the mod never forgets within a session. */
+    static void resetSuggestionLogForTest() {
+        synchronized (REPORTED_SUGGESTION_ROOTS) {
+            REPORTED_SUGGESTION_ROOTS.clear();
+            reportedRootlessRequest = false;
+        }
     }
 
     public static String rootOf(String command) {
