@@ -3,6 +3,7 @@ package studios.creeperdiamonds.cmdguard;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import net.fabricmc.loader.api.FabricLoader;
+import studios.creeperdiamonds.cmdguard.exposure.ExposureSettings;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -46,6 +47,8 @@ public final class GuardConfig {
 
     public Set<String> allowlist = new LinkedHashSet<>(STARTER_ALLOWLIST);
 
+    public ExposureSettings exposure = new ExposureSettings();
+
     private static GuardConfig instance;
 
     public static GuardConfig get() {
@@ -63,6 +66,10 @@ public final class GuardConfig {
                     if (loaded.allowlist == null) {
                         loaded.allowlist = new LinkedHashSet<>();
                     }
+                    if (loaded.exposure == null) {
+                        loaded.exposure = new ExposureSettings();
+                    }
+                    loaded.exposure.normalise();
                     return loaded;
                 }
             } catch (IOException | RuntimeException e) {
