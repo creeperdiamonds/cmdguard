@@ -22,6 +22,10 @@ advertises a channel or identifier the client does not actually have. See
   gives you strict default-deny.
 - **Clicked-command policy.** Plugin menus fire commands via a different path when you
   click them; those are allowed by default (toggle in config) so server GUIs keep working.
+- **Tab-completion guard.** Pressing Tab sends the partial command to the server *before*
+  you press enter, so a guard that only checked what you send on enter would be leaking the
+  same text one step earlier. Completion requests are judged by the same allowlist. This has
+  a real cost — see [Tab completion](#tab-completion). On by default.
 - **Channel audit.** `/cmdguard audit` lists every installed mod that has registered a
   networking channel — i.e. every mod a server could ask something of. This is the real,
   checkable version of "what can a server see about me."
@@ -29,6 +33,10 @@ advertises a channel or identifier the client does not actually have. See
   inbound traffic on channels outside the default namespace set is withheld unless you
   allow it. `/cmdguard exposure` shows the readout. See
   [Exposure whitelist](#exposure-whitelist) below.
+- **Login-query withholding.** A server can probe for a specific mod with a single login
+  query, before you have joined anything, and a mod that answers gives itself away.
+  CmdGuard lets vanilla's own empty reply stand instead. See
+  [The login phase](#the-login-phase).
 
 ## Commands
 
@@ -47,8 +55,8 @@ advertises a channel or identifier the client does not actually have. See
 | `/cmdguard withhold channel <id>` | Withhold one channel everywhere, even where its namespace is exposed |
 
 Config lives at `config/cmdguard.json`. A settings screen is available via Mod Menu,
-with toggles for the guard, clicked-command policy, the exposure whitelist, and
-whether inbound probes on withheld channels are blocked.
+with toggles for the guard, clicked-command policy, tab completion, the exposure whitelist,
+whether inbound probes on withheld channels are blocked, and login queries.
 
 Note that `/cmdguard off` switches the exposure whitelist off along with the command
 guard — it is the master switch for both. The config screen, `/cmdguard status` and
@@ -88,8 +96,10 @@ See [NOTES.md](NOTES.md) for the developer-facing hazard table.
 By default, CmdGuard withholds every channel outside the `fabric`, `minecraft`, and `c`
 namespaces, in both directions — outbound (what your client advertises or sends) and
 inbound (what a server sends you on that channel) — throughout the configuration and play
-phases of a connection. **The login phase is not covered**; see
-[What is not covered](#what-is-not-covered) below. This includes the identifier lists
+phases, and in the login phase by a different mechanism with the same outcome (see
+[The login phase](#the-login-phase): nothing is dropped there and nothing outbound can be
+filtered, because a login answer names no channel — instead the query reaches the client
+emptied, so vanilla answers it rather than a mod). This includes the identifier lists
 carried inside three of Fabric API's own payloads: the accepted-attachments,
 recipe-serializer, and custom-ingredient sync messages, each of which otherwise names
 every third-party mod that registered one. Everything outside those three namespaces is
@@ -144,24 +154,123 @@ instead of just that one connection. This covers more than ordinary multiplayer:
   early in a connection, before the per-connection key is established, that runs on global
   grants only; you cannot type a command during it, so you will never meet it.)
 
+## The login phase
+
+The login phase runs before configuration and play, and it is the one place a server can
+probe you before you have joined anything. It works differently enough to be worth its own
+section.
+
+A server can send a *login query* on any channel. A vanilla client always replies `null`,
+without even looking at the channel. A client with a mod that registered a handler for
+that channel replies with a real payload. **Answering at all, rather than what the answer
+says, is the disclosure** — one login query tells the server whether you have that mod.
+
+CmdGuard withholds the answer for a channel you have not exposed, and it does so by
+letting *vanilla* answer instead of the mod: the query is passed through with its payload
+replaced by the "unrecognised channel" payload vanilla itself produces, so the reply that
+goes on the wire is vanilla's own empty one, with the transaction id intact. CmdGuard
+sends no packet of its own and cancels nothing. The empty reply is a refusal, not a lie:
+it is the protocol's own "there is no payload" value, it names no channel, it is what
+every vanilla client sends, and it is byte-for-byte what Fabric's own API sends when a
+mod's handler declines.
+
+Dropping the query outright would not be silence — nothing on either side keeps track of
+an unanswered query, so the server just waits, and after 30 seconds you get a "Timed out"
+disconnect. A client that hangs stands out more than one that answers, so CmdGuard does
+not do that.
+
+**Two things to know if a join breaks.**
+
+- **The remedy is the *global* form of the command.** The login phase happens before the
+  connection has a server identity to hang a grant on, so per-server grants cannot apply
+  to it — only global ones. If a server's handshake genuinely needs a mod's real answer,
+  run **`/cmdguard expose global <namespace>`** and reconnect. `/cmdguard expose
+  <namespace>` (without `global`) will not help here, however right it looks.
+- **Look in `latest.log`.** A server that refuses the join over a withheld login answer
+  shows you *its* disconnect screen, which says nothing about CmdGuard. There is no chat
+  left to write to and `/cmdguard exposure` needs a connection, so every withheld login
+  answer is written to `latest.log` as a `WARN` naming the channel and the exact command
+  to run. That line is the only place the cause appears.
+
+**Singleplayer is exempt here too.** The login phase runs before a connection has a server
+identity, so it cannot use the per-server rule that exempts local worlds everywhere else.
+It is exempted directly instead: a local world's connection is an in-process one, and
+CmdGuard leaves login queries on it alone. That matters because the integrated server can
+itself send login queries — a mod's own server-side handshake — and withholding an answer
+from your own process buys nothing while it can stop the world from loading. Hosting with
+"Open to LAN" is still the same in-process connection and is still exempt; *joining*
+someone else's LAN game is a real connection and is filtered like any other server.
+
+You can switch this off on its own — "Login queries" in the Mod Menu settings screen —
+without disabling the rest of the exposure whitelist. It is on by default.
+
+## Tab completion
+
+**Pressing Tab sends what you have typed so far to the server.** That is vanilla
+behaviour, not something a mod added: the client asks the server to complete an argument
+by putting the partial command on the wire. So blocking `/somemod:debug` on enter while
+happily sending `somemod:debug` as a completion request would not be much of a guard.
+
+CmdGuard judges a completion request by **the same allowlist as the command it would
+become**. There is no second list and no second policy to keep in sync.
+
+**What that costs you, stated plainly rather than left to be discovered:**
+
+- **A command *name* cannot be completed against the server — only its arguments.** A
+  partial command does not yet have a complete root. `/ms` has the root `ms`, which is not
+  on your allowlist even though you are on your way to `/msg`, so CmdGuard withholds it.
+  The alternative — allowing anything that is a prefix of an allowlisted root — would send
+  `/m`, `/ms` and every other prefix to the server, which is exactly the keystroke leak
+  this is meant to stop. The strict reading is the correct trade for this mod.
+- **In practice you will rarely notice**, because the client completes command *names*
+  from its own copy of the command tree without asking the server at all. A request only
+  goes out when an *argument* asks the server — for example a player-name argument. So
+  `/ms<Tab>` normally sends nothing either way; what changes is that `/somemod:debug <Tab>`
+  no longer asks the server to complete its arguments. The rule is still enforced strictly,
+  because the command tree comes from the server and a server that wanted your keystrokes
+  could ask to be consulted right at the root.
+- **Completions for allowlisted commands keep working.** `/msg <Tab>` still completes
+  player names, because `msg` is on the allowlist.
+- **Command blocks lose their completions, and there you get nothing in return.** Two
+  boxes produce these requests: the chat box, and a command block's edit box. The edit
+  box's text has no leading `/`, and CmdGuard judges it by the same rule. Every vanilla
+  command-block root — `setblock`, `execute`, `give`, `summon` — is off the starter
+  allowlist, so block-state, item-id and selector completions stop working in command
+  blocks until you allow those roots (`/cmdguard allow setblock`, and so on). **Unlike
+  chat, withholding buys no protection there:** pressing **Done** sends
+  `ServerboundSetCommandBlockPacket`, which carries the whole command text, and CmdGuard
+  does not intercept that packet at all — so the server gets the full command anyway. The
+  parity argument that justifies this feature does not hold on that one surface. There is
+  still deliberately no exemption for the command-block screen: keying behaviour off a
+  screen class is fragile, and one rule you can reason about beats a carve-out. The
+  unguarded packet is recorded as a gap in [NOTES.md](NOTES.md), where it belongs — it is
+  a hole in the *command guard*, not something tab completion introduced.
+- **A blocked request is silent.** Tab simply shows nothing — there is no chat message,
+  because a request goes out on every keystroke and a message per keystroke would bury
+  your chat. The first time a given root is withheld, one line naming it and the
+  `/cmdguard allow <root>` remedy goes to `logs/latest.log`.
+- **Client commands from other mods are not exempt here**, unlike on the typed-command
+  path. A client mod's command never reaches the network when you run it — but if that mod
+  asks the server to complete one of its arguments (a real and easy mistake), the request
+  does, and it names the mod's command. That is one of the leak vectors CmdGuard exists to
+  catch, so it is not waved through.
+
+Switch it off on its own with the "Tab completion" toggle in the Mod Menu settings screen;
+`/cmdguard status` reports its state. `/cmdguard off` turns it off along with everything
+else.
+
 ## What is not covered
 
-**The login phase.** Everything above applies to the configuration and play phases of a
-connection. It does not apply to the login phase, which runs before either and uses a
-different pair of packets — `ClientboundCustomQueryPacket` and
-`ServerboundCustomQueryAnswerPacket`, neither of which is the custom-payload packet
-CmdGuard filters — handled by a listener that shares no base class with the ones CmdGuard
-hooks.
+**Behavioural fingerprinting.** CmdGuard controls what your client *says*, not how it
+behaves. Timing, capabilities, and which features work are out of scope, and a server that
+studies them can still draw conclusions. See [NOTES.md](NOTES.md) for the developer-facing
+detail.
 
-That matters because of how Fabric API answers a login query: a vanilla client always
-replies `null`, while a client with a mod that registered a login-query handler for that
-channel replies with a payload. **Answering at all, rather than what the answer says, is
-already the disclosure** — so a server that sends a login query on a mod's channel can
-learn whether you have that mod, and CmdGuard does not currently stop it.
-
-This is a design change rather than a fix — withholding a login answer means deciding what
-to send in its place, and CmdGuard does not fabricate — so it is written down here rather
-than papered over. See [NOTES.md](NOTES.md).
+**None of this has been tested in a running game.** There is no Minecraft client on the
+machine this is developed on. The interception points are verified against the decompiled
+1.21.11 sources and the mapped jar, and the decision logic is unit-tested, but Fabric
+mixins are applied at launch — so a successful build is evidence of compilation and
+nothing more. This is stated rather than papered over.
 
 ## Building
 

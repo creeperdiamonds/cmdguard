@@ -9,34 +9,32 @@ API branch `1.21.11`. This project uses **official Mojang mappings**.
 |---|---|---|---|
 | 1 | `CommandRegistrationCallback` instead of `ClientCommandRegistrationCallback` | one word apart; both compile | reference command uses the client one |
 | 2 | `connection.sendCommand(...)` as a "quick fix" | looks like the obvious way to run a command | that IS the hooked path — it's guarded |
-| 3 | `SuggestionProviders.ASK_SERVER` on a client arg | tab-completion sends a packet; command itself looks fine | avoid on client commands; none used here |
+| 3 | `SuggestionProviders.ASK_SERVER` on a client arg | tab-completion sends a packet; command itself looks fine | avoid on client commands; none used here — and the suggestion guard now filters the packet itself, without exempting client roots |
 | 4 | player feedback via a server-routed message | safe path is `Minecraft#gui.getChat().addMessage` | `OutboundGuard.say` / `sendFeedback` only |
 | 5 | a generic root literal | shadows the server command AND falls through when this mod isn't loaded | root is the mod id `cmdguard` |
 | 6 | registering a custom networking channel | announced via `minecraft:register` | this mod registers none |
 
 ## Known hazards
 
-### The login phase is not covered
+### The login phase — now covered, and the one hazard that can cost a join
 
 Verified 2026-08-29 against the same decompiled 1.21.11 sources and the Fabric API 0.141.6
-sources pinned in `gradle.properties`.
+sources pinned in `gradle.properties`. The investigation is
+`.superpowers/sdd/login-phase-spike.md`; this is the summary and the residual hazard.
 
-The exposure layer covers the configuration and play phases and nothing else. Two
-independent reasons, both structural:
+**Why the login phase needed separate work.** It uses a different pair of packets from the
+configuration and play phases. `ClientboundCustomQueryPacket` is not a
+`ClientboundCustomPayloadPacket`, and `ServerboundCustomQueryAnswerPacket` is
+`record ServerboundCustomQueryAnswerPacket(int transactionId, @Nullable
+CustomQueryAnswerPayload payload) implements Packet<ServerLoginPacketListener>` — not a
+`ServerboundCustomPayloadPacket`. So both `instanceof` tests in `ExposureGuard` skipped
+them even though both hooks saw the packets go past.
+`net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl` is declared
+`implements ClientLoginPacketListener` and extends none of this mod's mixin targets, so no
+listener-level hook reaches it either.
 
-- `net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl` is declared
-  `implements ClientLoginPacketListener` — it extends **none** of this mod's mixin targets,
-  so no listener-level hook reaches it.
-- The login phase's packets are a different pair. `ServerboundCustomQueryAnswerPacket` is
-  `record ServerboundCustomQueryAnswerPacket(int transactionId, @Nullable
-  CustomQueryAnswerPayload payload) implements Packet<ServerLoginPacketListener>` — **not**
-  a `ServerboundCustomPayloadPacket`, so `ExposureGuard.shouldDrop`'s `instanceof` skips it
-  even though the `Connection#sendPacket` hook does see it go past. Inbound,
-  `ClientboundCustomQueryPacket` is likewise not a `ClientboundCustomPayloadPacket`, so the
-  `channelRead0` hook skips it too.
-
-Why that is a disclosure and not just a gap. Vanilla always answers a login query with
-`null`:
+**Why that was a disclosure and not just a gap.** Vanilla always answers a login query
+with `null`, unconditionally, without ever looking at the channel:
 
 ```java
 // ClientHandshakePacketListenerImpl
@@ -52,11 +50,106 @@ for the queried channel; with no handler it returns false and the vanilla `null`
 So **answering at all — not the contents of the answer — is the disclosure**, and a server
 can probe for a specific mod by sending one login query.
 
-Deliberately not fixed here. Withholding a login answer means choosing what to put in its
-place, and this mod does not fabricate; picking between "stay silent and stall the login",
-"send the vanilla `null` a mod would not have sent", and "answer" is a design decision, not
-a bug fix. Written down rather than papered over. Also stated in the README under "What is
-not covered".
+**Outbound filtering is impossible here, verified.** `javap` on the two payload
+interfaces, side by side, is the whole finding:
+
+```
+net.minecraft.network.protocol.login.custom.CustomQueryPayload            // the QUERY side
+    public abstract net.minecraft.resources.Identifier id();
+    public abstract void write(net.minecraft.network.FriendlyByteBuf);
+
+net.minecraft.network.protocol.login.custom.CustomQueryAnswerPayload      // the ANSWER side
+    public abstract void write(net.minecraft.network.FriendlyByteBuf);
+    // ^ that is the entire interface. There is no id().
+```
+
+`ServerboundCustomQueryAnswerPacket#write` is `writeVarInt(transactionId)` then
+`writeNullable(payload, …)`. No identifier is ever written, so at the
+`Connection#sendPacket` hook the answer is an opaque `(int, maybe-bytes)` pair and no
+channel decision can be made on it. **The decision must be made inbound.**
+
+**And it must produce an answer rather than suppress one.** Cancelling the inbound query
+does not withhold, it stalls. There is no per-transaction accounting anywhere in vanilla —
+no map, set or counter keyed by transaction id on either side — so an unanswered query is
+not refused; a querying server is blocked on that transaction and sends nothing while it
+waits, and after 30 s of receiving nothing the client's own `ReadTimeoutHandler(30)`
+(`Connection.java:438`) fires `disconnect.timeout`. A hang is a behaviour no vanilla client
+exhibits, so it would disclose strictly more than the answer it was meant to avoid.
+
+**What is implemented.** At the same `Connection#channelRead0` `@ModifyVariable(HEAD,
+argsOnly, ordinal = 0)` the bundle filter already uses, a `ClientboundCustomQueryPacket`
+whose channel is withheld is replaced with
+`new ClientboundCustomQueryPacket(txid, new DiscardedQueryPayload(id))`. Fabric's mixin
+tests `packet.payload() instanceof PacketByteBufLoginQueryRequestPayload`, which now fails,
+so its addon is never consulted and vanilla's unconditional `null` answer stands. Nothing
+is cancelled, no packet CmdGuard constructs goes on the wire, and the transaction id is
+preserved. Both constructors are public — `javap`:
+
+```
+public net.minecraft.network.protocol.login.ClientboundCustomQueryPacket(int, CustomQueryPayload)
+    descriptor: (ILnet/minecraft/network/protocol/login/custom/CustomQueryPayload;)V
+public net.minecraft.network.protocol.login.custom.DiscardedQueryPayload(net.minecraft.resources.Identifier)
+    descriptor: (Lnet/minecraft/resources/Identifier;)V
+```
+
+**How the channel id is read, and what that was verified against.** Through the vanilla
+interface method `CustomQueryPayload#id() ()Lnet/minecraft/resources/Identifier;` — no
+Fabric `impl` import is needed for it. Two readings agree:
+
+- `javap -p -s` on the mapped merged jar shows `CustomQueryPayload` declaring `id()`, and
+  `DiscardedQueryPayload` (vanilla's own decode of an unrecognised query, produced by
+  `ClientboundCustomQueryPacket.readUnknownPayload`) implementing it as a record component.
+- The Fabric API 0.141.6 `fabric-networking-api-v1` 5.1.6 sources show
+  `ClientboundCustomQueryPacketMixin` injecting at `HEAD` of `readPayload` with
+  **no condition at all** — `cir.setReturnValue(new PacketByteBufLoginQueryRequestPayload(id,
+  PayloadHelper.read(buf, MAX_PAYLOAD_SIZE)))` — and that type is declared
+  `public record PacketByteBufLoginQueryRequestPayload(Identifier id, FriendlyByteBuf data)
+  implements CustomQueryPayload`.
+
+So with Fabric API installed the payload is *always* a
+`PacketByteBufLoginQueryRequestPayload`, and without it a `DiscardedQueryPayload`; both
+carry the id and both reach it through the same interface method. The read is correct
+either way, and the code depends on the vanilla interface rather than on Fabric's
+replacement staying unconditional.
+
+**Why the null answer is a refusal and not a lie.** The record component is declared
+`@Nullable` and written with `writeNullable`, so `null` is the protocol's own encoding of
+"there is no payload" rather than an invented stand-in. It carries zero identifiers, since
+`CustomQueryAnswerPayload` has no `id()`. It is vanilla's unconditional behaviour, not a
+pose. Fabric's own API treats `null` as the decline value — `ClientLoginNetworkAddon` emits
+`result == null ? null : new PacketByteBufLoginQueryResponse(result)`, i.e. a registered
+handler that completes with `null` produces a byte-identical packet. And it is the same act
+this mod already performs when it omits a channel from `minecraft:register`, moved one
+phase earlier.
+
+**Hazard 1: per-server grants cannot apply, and the wrong remedy makes the mod look
+broken.** `ExposureGuard.beginConnection` runs from `ClientCommonPacketListenerImpl`'s
+constructor, which is first reached at `handleLoginFinished` — *after* every login query.
+So no per-connection snapshot exists while login queries are arriving and
+`ConnectionMixin#cmdguard$snapshot()` necessarily returns `globalsOnlySnapshot()`. The
+remedy for a login broken by this filter is `/cmdguard expose global <namespace>` plus a
+reconnect. **The per-server form cannot help**, and a user told to run it will watch it
+fail and conclude the mod is broken. Do not "fix" this by trying to key the login filter to
+a server; the key does not exist yet.
+
+**Hazard 2: the failure mode is worse here than anywhere else, so it is logged at WARN.**
+Elsewhere a withheld channel means a feature quietly does not work. Here, a server whose
+handshake genuinely needs a real answer refuses the connection — and it surfaces as the
+*server's* disconnect screen with nothing on it pointing at CmdGuard. There is no chat to
+write to and `/cmdguard exposure` is unreachable from a disconnect screen, so `latest.log`
+is the only place the cause can appear. Every substitution logs at WARN, naming the channel
+and the exact remedy command. That is not polish; it is the difference between a
+diagnosable failure and a mystery. The ledger is deliberately *not* written from the login
+path: `beginConnection` resets it at `handleLoginFinished`, so a login entry would be wiped
+before anyone could read it and would be counted against the *previous* connection's tally
+on the way out.
+
+**Hazard 3: none of this has been run in Minecraft.** There is no client on this machine,
+mixin application is launch-time, and a green build proves nothing about any mixin target.
+The spike's "What in-game acceptance would look like" section describes the four-run matrix
+against a rig server that actually sends a login query; until at least its runs (a)-(c)
+have been done, the correct claim is that this builds and matches the decompiled sources —
+nothing stronger.
 
 ### `"required": true` does **not** make the build catch a wrong mixin target
 
@@ -71,6 +164,79 @@ runtime check, not a build-time one. The design doc's "a mapping change breaks t
 rather than shipping a jar whose guard silently does nothing" overstates it: it breaks the
 *game launch*. A green build is evidence of compilation and nothing more; every descriptor
 in this file was verified with `javap` against the mapped jar for exactly this reason.
+
+### Unguarded outbound path: `ServerboundSetCommandBlockPacket`
+
+**This is a gap in the command guard, not in the tab-completion guard, and it predates
+both.** Nobody had noticed it until the tab-completion review asked why command-block
+completions were being withheld for no protection gain. Recorded here rather than fixed:
+covering it is a separate decision, with its own trade-offs, and is deliberately *not*
+implemented.
+
+**What it carries.** Verified 2026-08-29 with `javap -p -c` over the Mojang-mapped 1.21.11
+merged jar — the same reading as everything else in this file:
+
+```
+net.minecraft.network.protocol.game.ServerboundSetCommandBlockPacket
+    public class ... implements Packet<ServerGamePacketListener>
+    private final net.minecraft.core.BlockPos pos;
+    private final java.lang.String command;      // FriendlyByteBuf.readUtf()
+    private final boolean trackOutput;
+    private final boolean conditional;
+    private final boolean automatic;
+    private final CommandBlockEntity$Mode mode;
+
+    public ServerboundSetCommandBlockPacket(BlockPos, String, CommandBlockEntity$Mode, boolean, boolean, boolean)
+```
+
+The `String` is the **whole command text**, not a prefix. `CommandBlockEditScreen`
+`#populateAndSendPacket` reads it straight off the edit box and sends it:
+
+```
+0: minecraft.getConnection()                       -> ClientPacketListener
+7: new ServerboundSetCommandBlockPacket
+12:   autoCommandBlock.getBlockPos()
+19:   commandEdit.getValue()                       // the full typed command
+26:   mode, isTrackOutput(), conditional, autoexec
+50: ClientPacketListener.send(Packet)
+```
+
+and `AbstractCommandBlockEditScreen#onDone` is `{ populateAndSendPacket(); ... }` — i.e.
+pressing **Done** sends it. `ServerboundSetCommandMinecartPacket` is the same hole in the
+minecart form: `private final int entity; private final java.lang.String command; private
+final boolean trackOutput;`, sent by `MinecartCommandBlockEditScreen#populateAndSendPacket`
+through the same `ClientPacketListener.send`.
+
+**Why it is not covered.** Nothing in `src` mentions either packet. `ConnectionMixin`'s
+outbound handler tests `packet instanceof ServerboundCommandSuggestionPacket` and nothing
+else, and `ClientPacketListenerMixin` hooks only `sendCommand` / `sendUnattendedCommand` —
+neither of which a command-block save goes through. Both packets do pass through
+`Connection#sendPacket`, so the choke point is already the right one; only the type test is
+missing.
+
+**The consequence for the tab-completion guard.** `AbstractCommandBlockEditScreen` is the
+only surface that produces slashless suggestion text, and the guard judges it — correctly
+and deliberately, since vanilla's own `handleCustomCommandSuggestions` treats that text as a
+command. But every vanilla command-block root (`setblock`, `execute`, `give`, `summon`) is
+off `GuardConfig.STARTER_ALLOWLIST`, so completions silently stop working in command blocks,
+**and withholding them protects nothing** — pressing Done ships the full text anyway. The
+parity argument that justifies the whole feature ("a suggestion request is judged by the
+same rule as the command it would become") does not hold on that one surface while this gap
+stands. The README says so plainly in its tab-completion section.
+
+**Not fixed by a screen-type exemption, and that was a choice.** Keying behaviour off a
+screen class is fragile — it can be reached from a subclass or another mod's screen, and it
+splits one rule into two — and one consistent rule is easier to reason about than a carve-out
+whose justification lives in a different file. The honest fix is to guard the packet; the
+honest interim is to say so.
+
+**If it is ever covered**, note the shape is not the same as the command guard's: the text
+arrives already complete and already committed by the user, there is no `clicked`
+distinction, and cancelling the packet leaves the command block holding its *old* command
+with the edit screen closed — a silent no-op the player has no reason to expect. That needs
+a chat message (`OutboundGuard#reportBlocked` is the precedent) and it needs deciding what
+"blocked" should mean for a block the player is standing in front of. Hence: a separate
+decision.
 
 ## Facts worth not re-litigating
 
@@ -90,6 +256,8 @@ in this file was verified with `javap` against the mapped jar for exactly this r
 
 - `ClientPacketListener#sendCommand(String)`
 - `ClientPacketListener#sendUnattendedCommand(String, Screen)` — clicked/menu commands
+- `ServerboundCommandSuggestionPacket(int id, String command)` — tab completion; reaches
+  `Connection#sendPacket` like everything else, accessors are `getId()` / `getCommand()`
 - `net.minecraft.resources.Identifier` — **renamed from `ResourceLocation`** in 1.21.11
 - `ClientPlayNetworking.getGlobalReceivers() / getSendable() / canSend(Identifier)`
 - `C2SPlayChannelEvents.Register.onChannelRegister(handler, sender, client, List<Identifier>)`
@@ -206,6 +374,29 @@ public PacketFlow getSending()   { return this.receiving.getOpposite(); }
 `public PacketFlow getOpposite()`. On a client connection `getSending()` is `SERVERBOUND`.
 The mixin must test it, because `Connection` is shared by both sides.
 
+**In-process-channel accessor, the `ConnectionMixin.java:117-118` `@Shadow` for the
+singleplayer login exemption:**
+
+```
+public boolean isMemoryConnection()
+    descriptor: ()Z
+```
+
+```java
+public boolean isMemoryConnection() {
+    return this.channel instanceof LocalChannel || this.channel instanceof LocalServerChannel;
+}
+```
+
+Verified 2026-08-29 the same two ways as the rest of this section. The decompiled source
+above is copied unedited from the `genSources` sources jar; `javap -p -s -c` over the
+mapped merged jar shows the same two-branch `instanceof` test against the `channel` field
+(`Lio/netty/channel/Channel;`) — `LocalChannel` then `LocalServerChannel`, `ior`-ed via
+`ifne`/`ifeq` into `iconst_1`/`iconst_0` — so the bytecode and the source agree line for
+line with no third branch and nothing else read. This is what
+`cmdguard$forceVanillaLoginAnswer`'s singleplayer exemption rests on entirely, so it is
+recorded here rather than left to stand on its own Javadoc's word.
+
 **Everything client-side really does reach the funnel.** Read, not assumed:
 
 - `ClientCommonPacketListenerImpl#send(Packet<?>)` —
@@ -217,10 +408,126 @@ The mixin must test it, because `Connection` is shared by both sides.
   `Minecraft.getInstance().getConnection().send(createC2SPacket(payload));` — so
   third-party mod traffic funnels through `Connection#sendPacket` too.
 
+### Outbound: tab-completion requests — the command guard's second half
+
+Verified 2026-08-29 the same two ways as everything else in this section: the decompiled
+1.21.11 sources from the `genSources` jar, and `javap` over the Mojang-mapped merged jar
+for every descriptor.
+
+**The leak.** `ClientPacketListenerMixin` guards `sendCommand` and
+`sendUnattendedCommand`, so `/somemod:debug` never leaves the client. Pressing Tab sends
+the same text earlier. From `net.minecraft.client.multiplayer.ClientSuggestionProvider`:
+
+```java
+@Override
+public CompletableFuture<Suggestions> customSuggestion(CommandContext<?> commandContext) {
+    if (this.pendingSuggestionsFuture != null) {
+        this.pendingSuggestionsFuture.cancel(false);
+    }
+
+    this.pendingSuggestionsFuture = new CompletableFuture<>();
+    int i = ++this.pendingSuggestionsId;
+    this.connection.send(new ServerboundCommandSuggestionPacket(i, commandContext.getInput()));
+    return this.pendingSuggestionsFuture;
+}
+```
+
+**The packet** (`javap -p -s`, mapped merged jar). Note it is a plain class, **not** a
+record — the accessors are `getId()` / `getCommand()`, not `id()` / `command()`:
+
+```
+net.minecraft.network.protocol.game.ServerboundCommandSuggestionPacket
+    public class ... implements Packet<ServerGamePacketListener>
+    private final int id;
+    private final java.lang.String command;
+
+    public ServerboundCommandSuggestionPacket(int, java.lang.String)
+        descriptor: (ILjava/lang/String;)V
+    public int getId()
+        descriptor: ()I
+    public java.lang.String getCommand()
+        descriptor: ()Ljava/lang/String;
+```
+
+**It reaches the existing outbound choke point, so no new mixin was needed.** The field
+`ClientSuggestionProvider.connection` is a `ClientPacketListener`, and
+`ClientCommonPacketListenerImpl#send(Packet<?>)` is a one-line
+`{ this.connection.send(packet); }` into `Connection#send(Packet)`, which is
+`send(packet, null)` → `send(packet, null, true)` → `sendPacket(...)` — the private funnel
+this file already documents above. The guard is therefore one more `@Inject` at `HEAD` of
+`sendPacket`, alongside the exposure layer's.
+
+**What the string actually contains.** Brigadier decides this, not Minecraft.
+`CommandDispatcher#getCompletionSuggestions(ParseResults, int cursor)` — read from the
+bytecode of `brigadier-1.3.10.jar` — does:
+
+```
+30: aload_1  ParseResults.getReader()          // the StringReader the caller passed in
+34:          ImmutableStringReader.getString() // the WHOLE line, slash included
+43: iconst_0
+44: iload_2  cursor
+45:          String.substring(0, cursor)       // -> the string handed to build(...)
+122:         CommandContextBuilder.build(<that substring>)
+```
+
+So `commandContext.getInput()` is **the typed line truncated at the cursor**, and it keeps
+whatever leading `/` the edit box had. Which it has depends on the screen:
+
+- `ChatScreen` builds `new CommandSuggestions(..., commandsOnly = false, ...)`, and
+  `CommandSuggestions#updateCommandInfo` only takes the dispatcher branch when the text
+  starts with `/`. So chat text carries the slash.
+- `AbstractCommandBlockEditScreen` builds it with `commandsOnly = true`, and its box has no
+  slash. Its completion requests ride this same packet with no leading `/`.
+- **Plain chat suggestions never produce this packet at all.** The non-command branch of
+  `updateCommandInfo` is `SharedSuggestionProvider.suggest(getCustomTabSugggestions(), ...)`
+  — a local list of player names, no packet. So "no leading slash" here means "command
+  block", not "chat".
+
+Vanilla's server half agrees: `ServerGamePacketListenerImpl#handleCustomCommandSuggestions`
+opens with `new StringReader(packet.getCommand())` and skips a `'/'` only `if
+(stringReader.canRead() && stringReader.peek() == '/')`. `CommandRoot.of` matches that.
+
+**Command *names* are completed locally.** Worth recording, because it sizes the usability
+cost of the conservative policy. `updateCommandInfo` parses against
+`ClientPacketListener#getCommands()` — the tree the server already sent in
+`ClientboundCommandsPacket` — and brigadier's `getCompletionSuggestions` iterates
+`nodeBeforeCursor.parent.getChildren()` calling `listSuggestions` on each. A root-level
+child is a `LiteralCommandNode`, whose `listSuggestions` matches literals in memory and
+sends nothing. Only an **argument** node whose suggestion provider asks the server (vanilla's
+`SuggestionProviders.ASK_SERVER`, which routes to `SharedSuggestionProvider#customSuggestion`)
+produces a `ServerboundCommandSuggestionPacket`. So `/ms<Tab>` normally sends nothing, and
+withholding it costs nothing. The policy is still enforced conservatively because the command
+tree is server-supplied: a server that wanted the client's keystrokes could hang an
+`ASK_SERVER` argument node directly under the root and receive every character typed after
+the slash.
+
+**Cancelling the packet is safe.** `customSuggestion` has already stored its
+`CompletableFuture` in `CommandSuggestions.pendingSuggestions`. Every read of that field is
+guarded: the render path tests `this.pendingSuggestions != null && this.pendingSuggestions
+.isDone()` before `join()`, and the only other `join()` (in `updateUsageInfo`) runs solely
+from the `thenRun` callback that a completion triggers. A future that never completes leaves
+the popup empty and nothing else; the next keystroke's `customSuggestion` cancels it. No
+`join()` on an incomplete future exists, so there is no hang and no exception.
+
+**Leak vector #3, closed.** The table at the top of this file has warned since day one that
+`SuggestionProviders.ASK_SERVER` on a *client* command's argument sends a packet while the
+command itself looks local. That is why the suggestion guard deliberately does **not** exempt
+a client-dispatcher root the way `OutboundGuard#shouldBlock` does: for a typed command, a
+client root never reaches the network; for a completion request it does.
+
 ### Inbound: `net.minecraft.network.Connection#channelRead0` — the real choke point
 
 **This is where the inbound filter lives**, and the reason is a race, not taste. Verified
 2026-08-29 by the same two readings as the rest of this section.
+
+Three handlers hang off this one method, because one pipeline message is not one packet of
+one type: `cmdguard$dropWithheldInbound` cancels a bare `ClientboundCustomPayloadPacket`,
+`cmdguard$filterBundledPayloads` rebuilds a `ClientboundBundlePacket` without its withheld
+sub-payloads, and `cmdguard$forceVanillaLoginAnswer` substitutes the payload of a
+login-phase `ClientboundCustomQueryPacket` (see "The login phase" under Known hazards).
+All three attach at `HEAD` and their relative order is undefined, which is fine because
+they match mutually disjoint packet types and each returns its argument untouched when it
+does not match.
 
 ```
 protected void channelRead0(ChannelHandlerContext, Packet<?>)

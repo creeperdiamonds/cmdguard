@@ -9,6 +9,9 @@ import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
 import net.minecraft.network.protocol.game.ClientGamePacketListener;
 import net.minecraft.network.protocol.game.ClientboundBundlePacket;
+import net.minecraft.network.protocol.login.ClientboundCustomQueryPacket;
+import net.minecraft.network.protocol.login.custom.CustomQueryPayload;
+import net.minecraft.network.protocol.login.custom.DiscardedQueryPayload;
 import net.minecraft.resources.Identifier;
 import studios.creeperdiamonds.cmdguard.CmdGuardClient;
 import studios.creeperdiamonds.cmdguard.GuardConfig;
@@ -52,6 +55,18 @@ public final class ExposureGuard {
     private static final ExposurePolicy DENY_ALL = new ExposurePolicy(Set.of(), Set.of(), Set.of());
 
     private static final ChannelLedger LEDGER = new ChannelLedger();
+
+    /**
+     * The id used for a substituted login-query payload when the decision could not be made
+     * at all -- the real channel could not be read, or something else in {@link
+     * #forceVanillaLoginAnswer} threw. Unreachable with any payload vanilla or Fabric API
+     * produces (all of them are records whose {@code id()} is a field read), but a
+     * third-party {@code CustomQueryPayload} can return a null id, so it exists to let that
+     * whole path still fail closed rather than throw. It never reaches the wire: see {@link
+     * #forceVanillaLoginAnswer}'s "not fabrication" paragraph.
+     */
+    private static final Identifier WITHHELD_QUERY_MARKER =
+            Identifier.fromNamespaceAndPath("cmdguard", "withheld_login_query");
 
     /**
      * One-shot flag set by a mixin on {@code ClientCommonPacketListenerImpl#handleTransfer}
@@ -108,8 +123,18 @@ public final class ExposureGuard {
      * connection is actually judged against. {@code null} only for {@link
      * #globalsOnlySnapshot()}, which is a fallback that by construction never learns which
      * server it is talking to.
+     *
+     * <p>{@code filterLogin} is frozen here alongside the rest, but note that in the login
+     * phase it is only ever read off a {@link #globalsOnlySnapshot()} -- {@link
+     * #beginConnection} runs from {@code ClientCommonPacketListenerImpl}'s constructor, which
+     * is reached at {@code handleLoginFinished}, i.e. strictly after every login query has
+     * been answered. See {@link #forceVanillaLoginAnswer}.
      */
-    public record Snapshot(boolean active, boolean filterInbound, ExposurePolicy policy, String serverKey) {
+    public record Snapshot(boolean active,
+                           boolean filterInbound,
+                           boolean filterLogin,
+                           ExposurePolicy policy,
+                           String serverKey) {
     }
 
     /**
@@ -253,8 +278,11 @@ public final class ExposureGuard {
             logPreviousConnectionSummary();
             LEDGER.reset();
             CmdGuardClient.LOGGER.info(
-                    "[cmdguard] exposure filter armed for {}: filtering={}, inbound filtering={}",
-                    describeKey(snapshot.serverKey()), snapshot.active(), snapshot.filterInbound());
+                    "[cmdguard] exposure filter armed for {}: filtering={}, inbound filtering={},"
+                            + " login filtering={} (login queries were already handled under the"
+                            + " globals-only policy before this line)",
+                    describeKey(snapshot.serverKey()), snapshot.active(), snapshot.filterInbound(),
+                    snapshot.filterLogin());
             if (isTransfer) {
                 NEXT_CONNECTION_IS_TRANSFER.compareAndSet(true, false);
             }
@@ -304,6 +332,7 @@ public final class ExposureGuard {
         return new Snapshot(
                 config.exposureActive() && !SINGLEPLAYER_KEY.equals(serverKey),
                 config.exposure.filterInbound,
+                config.exposure.filterLogin,
                 config.exposure.policyFor(serverKey),
                 serverKey);
     }
@@ -336,7 +365,11 @@ public final class ExposureGuard {
                 config.exposure.exposedNamespaces,
                 config.exposure.exposedChannels,
                 config.exposure.withheldChannels);
-        return new Snapshot(config.exposureActive(), config.exposure.filterInbound, policy, null);
+        return new Snapshot(config.exposureActive(),
+                config.exposure.filterInbound,
+                config.exposure.filterLogin,
+                policy,
+                null);
     }
 
     /** True when this packet must not leave the client at all. */
@@ -517,6 +550,170 @@ public final class ExposureGuard {
                     "[cmdguard] bundle filter failed; refusing to deliver an unfiltered bundle", e);
             throw e;
         }
+    }
+
+    /**
+     * The login-phase choke point: returns {@code packet} with its payload replaced by a
+     * {@code DiscardedQueryPayload} when the queried channel is withheld, or the very same
+     * object when it is not.
+     *
+     * <p><b>Why a substitution and not a drop.</b> The rest of this class withholds by
+     * dropping. That is not available here. Nothing in vanilla does per-transaction
+     * accounting -- there is no map, set or counter keyed by transaction id on either side --
+     * so an unanswered query is not refused, it simply stalls: a querying server is by
+     * construction blocked on that transaction, so it sends nothing, and after 30 s of
+     * receiving nothing the client's own {@code ReadTimeoutHandler(30)} (installed in
+     * {@code Connection}) fires {@code disconnect.timeout}. A hang is a behaviour no vanilla
+     * client exhibits, so it would disclose strictly more than the answer it was meant to
+     * avoid. Substituting instead means: nothing is cancelled, no packet this mod constructs
+     * ever goes on the wire, the transaction id is preserved, and the answer that is sent is
+     * produced by unmodified vanilla code.
+     *
+     * <p><b>How the substitution works.</b> Vanilla's
+     * {@code ClientHandshakePacketListenerImpl#handleCustomQuery} is unconditional -- it reads
+     * no channel, has no recognised-channel set, and always sends
+     * {@code new ServerboundCustomQueryAnswerPacket(transactionId, null)}. Fabric API's
+     * {@code ClientHandshakePacketListenerImplMixin} cancels that send only when
+     * {@code packet.payload() instanceof PacketByteBufLoginQueryRequestPayload} <em>and</em>
+     * its addon finds a registered handler for the channel. A {@code DiscardedQueryPayload}
+     * fails that {@code instanceof}, so the addon is never consulted and vanilla's send stands.
+     * Verified 2026-08-29 with {@code javap} against the mapped 1.21.11 merged jar (both
+     * constructors used here are public:
+     * {@code ClientboundCustomQueryPacket(int, CustomQueryPayload)} and
+     * {@code DiscardedQueryPayload(Identifier)}) and against the Fabric API 0.141.6 sources
+     * pinned in {@code gradle.properties}.
+     *
+     * <p><b>Reading the channel id.</b> {@code CustomQueryPayload} declares
+     * {@code Identifier id()}, and Fabric API's {@code ClientboundCustomQueryPacketMixin}
+     * replaces the decoded payload of <em>every</em> login query, unconditionally, with a
+     * {@code PacketByteBufLoginQueryRequestPayload(Identifier id, FriendlyByteBuf data)} --
+     * which implements {@code CustomQueryPayload}. So the id is read through the vanilla
+     * interface and this file needs no Fabric {@code impl} import to get it. Vanilla's own
+     * {@code readUnknownPayload} produces a {@code DiscardedQueryPayload}, which carries the
+     * id too, so the read is correct with or without Fabric's mixin.
+     *
+     * <p><b>A null answer is a refusal, not a lie.</b> The record component is declared
+     * {@code @Nullable CustomQueryAnswerPayload payload} and is written with
+     * {@code writeNullable}, so null is the protocol's own encoding of "there is no payload",
+     * not a value invented to stand in for one. It carries zero identifiers --
+     * {@code CustomQueryAnswerPayload} declares only {@code write(FriendlyByteBuf)}, no
+     * {@code id()}, so the answer packet never names a channel at all. It is vanilla's
+     * unconditional behaviour rather than a pose adopted for the occasion, and Fabric's own
+     * API treats it as the sanctioned decline value: a registered handler whose future
+     * completes with {@code null} emits a byte-identical packet. This is the same act as
+     * omitting a channel from {@code minecraft:register} -- one phase earlier.
+     *
+     * <p><b>Per-server grants cannot apply here, and that is structural.</b> {@link
+     * #beginConnection} runs from {@code ClientCommonPacketListenerImpl}'s constructor, which
+     * is first reached at {@code handleLoginFinished} -- after the login phase is over. So no
+     * per-connection snapshot exists while login queries are arriving, and {@code
+     * ConnectionMixin#cmdguard$snapshot()} necessarily returns {@link #globalsOnlySnapshot()}.
+     * The remedy for a login broken by this filter is therefore always a global command plus a
+     * reconnect -- {@code /cmdguard expose global <namespace>}, or {@code /cmdguard expose
+     * channel <id>} when the channel was withheld by name and the namespace form provably
+     * could not help. {@link LoginQueryFilter#remedyCommand} picks between them; the
+     * per-server form is never right here, and telling a user to run it would leave them
+     * concluding the mod is broken.
+     *
+     * <p><b>The warning is not polish.</b> If a server's handshake genuinely needs a real
+     * answer, withholding it breaks the join -- and it surfaces as the <em>server's</em>
+     * disconnect screen, with nothing on it pointing at this mod. There is no chat to write
+     * to and {@code /cmdguard exposure} is unreachable from a disconnect screen, so {@code
+     * latest.log} is the only place the cause can appear. It is logged at WARN, once per
+     * substitution rather than once per channel: vanilla sends no login queries at all, so the
+     * volume is bounded by what the server asks and there is nothing to flood. The {@link
+     * ChannelLedger} deliberately is <em>not</em> written here -- {@link #beginConnection}
+     * resets it at {@code handleLoginFinished}, which is after every login query, so a login
+     * entry would be wiped before any user could read it and would be counted against the
+     * <em>previous</em> connection's tally on the way out.
+     *
+     * <p><b>Fail closed, and <em>total</em>.</b> The decision itself is {@link
+     * LoginQueryFilter#withholds}, which withholds on a null id, a null policy and any
+     * exception. But the steps around it can throw too, and this method must never let one
+     * escape: it is called from a {@code @ModifyVariable} on {@code Connection#channelRead0},
+     * so an exception thrown here propagates out of {@code channelRead0} into {@code
+     * Connection#exceptionCaught}, which disconnects the player with "Internal Exception" --
+     * the broken join this whole design exists to avoid, reached by accident. The concrete
+     * route was real: a third-party {@code CustomQueryPayload} is free to return {@code null}
+     * from {@code id()} (the record component is unvalidated), and {@code toString()} on that
+     * null is an NPE. So the entire body sits in one {@code catch (RuntimeException)} that
+     * substitutes the withheld-query packet, making the method total in the safe direction --
+     * every path either passes the packet through or withholds it, and none throws.
+     *
+     * <p><b>The contrast with {@link #filterBundle} is deliberate.</b> That method rethrows,
+     * on purpose, and is correct to: it is handed a bundle of arbitrary play-phase packets it
+     * could not filter, and delivering one unfiltered is worse than losing the connection.
+     * Here the trade runs the other way -- the packet in hand is a single login query whose
+     * unfilterable form is already handled (it is withheld), so throwing would buy no privacy
+     * at all and would cost a stalled or torn-down login. Do not "harmonise" the two.
+     *
+     * <p>Substituting under this mod's own sentinel id is not fabrication: nothing derived
+     * from a {@code DiscardedQueryPayload}'s id is ever written to a socket, because the only
+     * thing sent in response is {@code (transactionId, null)} and the answer payload interface
+     * has no identifier in it. The id is a local dispatch marker; the wire sees a varint and a
+     * boolean.
+     *
+     * <p><b>Singleplayer never reaches this method.</b> A local world's connection is
+     * exempted at the call site, in {@code ConnectionMixin#cmdguard$forceVanillaLoginAnswer},
+     * via {@code Connection#isMemoryConnection()} -- the login phase runs on the globals-only
+     * snapshot, which by construction has no server key and so cannot apply {@link
+     * #snapshotFor}'s {@link #SINGLEPLAYER_KEY} exemption. See that method's Javadoc.
+     */
+    public static Packet<?> forceVanillaLoginAnswer(ClientboundCustomQueryPacket packet, Snapshot snapshot) {
+        try {
+            if (!snapshot.active() || !snapshot.filterLogin()) {
+                return packet;
+            }
+            CustomQueryPayload payload = packet.payload();
+            if (payload instanceof DiscardedQueryPayload) {
+                // Already unreachable by any mod handler -- vanilla decoded it as unknown and
+                // will answer null on its own. Nothing to withhold, and claiming otherwise in
+                // the log would be false. With Fabric API installed this branch is dead (its
+                // readPayload mixin is unconditional); it exists so that a future Fabric that
+                // made that mixin conditional degrades to vanilla behaviour rather than to a
+                // spurious warning.
+                return packet;
+            }
+            // Deliberately inside the try: CustomQueryPayload#id() is an interface call into
+            // whatever third party implemented it, its record component is unvalidated and may
+            // be null, and toString() on a null id is the concrete NPE this catch exists for.
+            Identifier channel = payload.id();
+            String id = channel.toString();
+            if (!LoginQueryFilter.withholds(id, snapshot.active(), snapshot.filterLogin(),
+                    snapshot.policy())) {
+                return packet;
+            }
+            warnLoginWithheld(id, snapshot.policy());
+            return withheldQuery(packet, channel);
+        } catch (RuntimeException e) {
+            CmdGuardClient.LOGGER.error(
+                    "[cmdguard] login-query filtering failed; withholding the query", e);
+            return withheldQuery(packet, WITHHELD_QUERY_MARKER);
+        }
+    }
+
+    /**
+     * The substituted packet: same transaction id, payload replaced by the one type vanilla
+     * itself produces for a channel it does not recognise.
+     */
+    private static Packet<?> withheldQuery(ClientboundCustomQueryPacket packet, Identifier channel) {
+        return new ClientboundCustomQueryPacket(packet.transactionId(), new DiscardedQueryPayload(channel));
+    }
+
+    /**
+     * The one line that makes a broken join diagnosable. WARN, not INFO, because unlike every
+     * other withhold in this class the consequence can be that the player cannot join at all,
+     * and the disconnect they see comes from the server with no mention of CmdGuard on it.
+     */
+    private static void warnLoginWithheld(String channel, ExposurePolicy policy) {
+        CmdGuardClient.LOGGER.warn(
+                "[cmdguard] withheld the login-phase query on channel {}. Vanilla's empty answer"
+                        + " was sent in its place, so no mod answered it. If this server now"
+                        + " refuses the join, this is why: run \"{}\" and reconnect. The"
+                        + " per-server form (\"/cmdguard expose <namespace>\") cannot help here"
+                        + " -- the login phase runs before this connection has a server"
+                        + " identity, so only global grants are in force.",
+                channel, LoginQueryFilter.remedyCommand(channel, policy));
     }
 
     /**

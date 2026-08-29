@@ -70,6 +70,27 @@ public final class ExposurePolicy {
     }
 
     /**
+     * True when this exact channel id was withheld by name, via {@code /cmdguard withhold
+     * channel <id>}.
+     *
+     * <p>Exists so a remedy suggested to the user can be one that will actually work.
+     * {@link #isExposed} checks {@link #withheldChannels} <em>before</em> the namespace
+     * grants, so for a channel in that set no amount of {@code /cmdguard expose global
+     * <namespace>} changes the answer -- a user told to run it would run it, watch nothing
+     * happen, and conclude the mod is broken, which is precisely what that advice exists to
+     * prevent. {@code /cmdguard expose channel <id>} is the command that helps, because it
+     * also clears the channel-level withhold.
+     *
+     * <p>Reports the raw membership, not the whole precedence chain: {@link #NEVER_WITHHELD}
+     * still beats this set inside {@link #isExposed}, so a channel could be listed here and
+     * exposed anyway. That is not a problem for the one caller, which only asks after
+     * {@link #isExposed} has already returned false.
+     */
+    public boolean isWithheldByName(String channelId) {
+        return channelId != null && withheldChannels.contains(channelId.toLowerCase(Locale.ROOT));
+    }
+
+    /**
      * True for an id that could actually be a channel and could actually match: shaped like
      * {@code namespace:path}, both halves non-empty, exactly one colon, <em>and</em> made
      * only of characters the game's own {@code Identifier} accepts.

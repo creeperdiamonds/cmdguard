@@ -82,7 +82,8 @@ public final class CmdGuardCommands {
                         : Component.literal("OFF").withStyle(ChatFormatting.RED))
                 .append(Component.literal("  (" + config.allowlist.size()
                         + " allowlisted, clicked commands "
-                        + (config.allowClickedCommands ? "allowed" : "blocked") + ")")
+                        + (config.allowClickedCommands ? "allowed" : "blocked")
+                        + ", tab completion " + suggestionQualifier(config) + ")")
                         .withStyle(ChatFormatting.GRAY)));
 
         // The exposure layer is gated on config.enabled too, so /cmdguard off turns it off
@@ -96,6 +97,25 @@ public final class CmdGuardCommands {
                 .append(Component.literal("  (" + exposureQualifier(config) + ")")
                         .withStyle(ChatFormatting.GRAY)));
         return 1;
+    }
+
+    /**
+     * The tab-completion setting <em>as it is actually in force</em>, matching what
+     * {@code ConfigScreen#suggestionLabel} puts on the toggle.
+     *
+     * <p>{@code config.enabled} gates the suggestion guard too ({@link SuggestionFilter}
+     * checks the master switch first), so this readout used to say "tab completion allowlist
+     * only" while {@code /cmdguard off} had switched it off entirely -- the same defect the
+     * config screen's exposure labels were fixed for, in the one place a player is most
+     * likely to go looking for the answer.
+     *
+     * <p>Shortened to "(inactive)" rather than the screen's "(inactive, guard off)" because
+     * this string is appended to a line that opens with "CmdGuard is OFF"; the screen's
+     * {@code inboundLabel} and {@code loginLabel} use the same short form for the same reason.
+     */
+    private static String suggestionQualifier(GuardConfig config) {
+        String state = config.guardSuggestions ? "allowlist only" : "unrestricted";
+        return config.enabled ? state : state + " (inactive)";
     }
 
     /** Why filtering is off for the connection this snapshot belongs to. */
@@ -121,6 +141,8 @@ public final class CmdGuardCommands {
         }
         return "inbound probes "
                 + (config.exposure.filterInbound ? "blocked" : "allowed")
+                + ", login queries "
+                + (config.exposure.filterLogin ? "answered by vanilla" : "answerable by mods")
                 + ", " + config.exposure.exposedNamespaces.size() + " namespaces exposed";
     }
 

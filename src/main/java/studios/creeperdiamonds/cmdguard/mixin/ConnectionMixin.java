@@ -7,6 +7,8 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.game.ClientboundBundlePacket;
+import net.minecraft.network.protocol.game.ServerboundCommandSuggestionPacket;
+import net.minecraft.network.protocol.login.ClientboundCustomQueryPacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -15,6 +17,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import studios.creeperdiamonds.cmdguard.CmdGuardClient;
+import studios.creeperdiamonds.cmdguard.OutboundGuard;
 import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
 
 import java.util.concurrent.atomic.AtomicReference;
@@ -62,6 +65,20 @@ import java.util.concurrent.atomic.AtomicReference;
  * same argument that put the outbound filter on {@code sendPacket} rather than on a public
  * {@code send} overload.
  *
+ * <p><b>Two outbound concerns, not one.</b> This class began as the exposure layer's choke
+ * point, but {@code sendPacket} is where <em>every</em> serverbound packet passes, so the
+ * command guard's tab-completion half lives here too -- a
+ * {@code ServerboundCommandSuggestionPacket} carries the partial command and reaches this
+ * method through {@code ClientPacketListener#send}. It is judged by the command allowlist, not
+ * by the exposure policy; the two never consult each other. See
+ * {@link #cmdguard$guardSuggestionRequest}.
+ *
+ * <p><b>Three inbound handlers, not one</b>, because "one pipeline message" is not "one
+ * packet of one type": a bare {@code ClientboundCustomPayloadPacket} is cancelled, a
+ * {@code ClientboundBundlePacket} is rebuilt without its withheld sub-payloads, and a
+ * login-phase {@code ClientboundCustomQueryPacket} has its payload substituted so that
+ * vanilla, rather than a mod, answers it. See each handler's own Javadoc.
+ *
  * <p><b>Per-connection snapshot.</b> {@code sendPacket} provably runs on two threads (the
  * client thread via {@code ClientCommonPacketListenerImpl#send}, and the netty event loop
  * via the {@code runOnceConnected} lambda and the {@code pendingActions} drain), and a
@@ -82,6 +99,23 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
 
     @Shadow
     public abstract PacketFlow getReceiving();
+
+    /**
+     * True when this connection's netty channel is an in-process one -- i.e. the client
+     * talking to its own integrated server.
+     *
+     * <p>Verified 2026-08-29 with {@code javap} against the mapped 1.21.11 merged jar: the
+     * method is {@code public boolean isMemoryConnection()} and its body is exactly {@code
+     * this.channel instanceof LocalChannel || this.channel instanceof LocalServerChannel}.
+     * {@code Connection#connectToLocalServer} bootstraps through {@code
+     * EventLoopGroupHolder.local()}, whose channel class is {@code LocalChannel} (also read
+     * off the bytecode), so a local world's connection is exactly the set this returns true
+     * for. A real socket connection -- including <em>joining</em> someone else's LAN game --
+     * goes through {@code connectToServer} and a {@code NioSocketChannel}, so it returns
+     * false. See {@link #cmdguard$forceVanillaLoginAnswer}.
+     */
+    @Shadow
+    public abstract boolean isMemoryConnection();
 
     /**
      * The real, per-server decision surface for this connection, once installed. Written
@@ -191,6 +225,66 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
         }
     }
 
+    /**
+     * The command guard's second half: tab completion, which leaks the same text one step
+     * earlier than running the command does.
+     *
+     * <p>{@code ClientPacketListenerMixin} guards {@code sendCommand} and {@code
+     * sendUnattendedCommand}, so a command whose root is not allowlisted never leaves the
+     * client. But pressing Tab sends the partial text first:
+     * {@code ClientSuggestionProvider#customSuggestion} does
+     * {@code this.connection.send(new ServerboundCommandSuggestionPacket(i,
+     * commandContext.getInput()))}, and {@code ClientCommonPacketListenerImpl#send(Packet)} is
+     * a one-line {@code this.connection.send(packet)} into {@code Connection#send}, which
+     * calls {@code sendPacket}. So the request already passes through this very choke point
+     * and the guard needs no mixin of its own -- only this handler. Verified 2026-08-29
+     * against the decompiled 1.21.11 sources and, for the accessors, {@code javap} over the
+     * mapped merged jar; see {@code NOTES.md}, "Outbound: tab-completion requests".
+     *
+     * <p>The decision is {@link OutboundGuard#shouldBlockSuggestion}, which defers to the
+     * Minecraft-free, unit-tested {@code SuggestionFilter}. It reuses the command allowlist:
+     * a completion request is judged by the same rule as the command it would become.
+     *
+     * <p><b>Cancelling is safe, and this was read rather than assumed.</b> {@code
+     * customSuggestion} has already created {@code pendingSuggestionsFuture} and returned it
+     * to {@code CommandSuggestions}, which stores it in {@code pendingSuggestions}. Every read
+     * of that field in {@code CommandSuggestions} is guarded by {@code isDone()} -- the render
+     * path checks it explicitly, and {@code updateUsageInfo} (the only other {@code join()})
+     * runs solely from the {@code thenRun} callback -- so a future that never completes leaves
+     * the suggestion popup empty and nothing else. The next keystroke's {@code
+     * customSuggestion} call cancels it outright. No hang, no leak, no exception.
+     *
+     * <p>Fail closed: an exception while deciding cancels the send rather than letting the
+     * request out. The {@code instanceof} and the flow check sit outside the {@code try} on
+     * purpose, exactly as in {@link #cmdguard$dropWithheldInbound}, so a fail-closed cancel
+     * can only ever drop a suggestion request and never some unrelated packet.
+     *
+     * <p>This and {@link #cmdguard$dropWithheld} both attach at {@code HEAD} of {@code
+     * sendPacket} and their relative order is undefined, which is fine because they match
+     * disjoint packet types: a {@code ServerboundCommandSuggestionPacket} is not a {@code
+     * ServerboundCustomPayloadPacket}. Same pairing argument as the three inbound handlers.
+     */
+    @Inject(method = "sendPacket(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
+            at = @At("HEAD"), cancellable = true)
+    private void cmdguard$guardSuggestionRequest(Packet<?> packet,
+                                                 ChannelFutureListener listener,
+                                                 boolean flush,
+                                                 CallbackInfo ci) {
+        if (getSending() != PacketFlow.SERVERBOUND
+                || !(packet instanceof ServerboundCommandSuggestionPacket suggestion)) {
+            return;
+        }
+        try {
+            if (OutboundGuard.shouldBlockSuggestion(suggestion.getCommand())) {
+                ci.cancel();
+            }
+        } catch (RuntimeException e) {
+            CmdGuardClient.LOGGER.error(
+                    "[cmdguard] suggestion guard check failed, withholding the request", e);
+            ci.cancel();
+        }
+    }
+
     @ModifyVariable(method = "sendPacket(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
             at = @At("HEAD"), argsOnly = true, ordinal = 0)
     private Packet<?> cmdguard$filterIdentifiers(Packet<?> packet) {
@@ -283,5 +377,86 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
             return packet;
         }
         return ExposureGuard.filterBundle(bundle, cmdguard$snapshot());
+    }
+
+    /**
+     * The third half of the inbound choke point: the login phase, which is neither a custom
+     * payload nor a bundle.
+     *
+     * <p>A login query arrives as a {@code ClientboundCustomQueryPacket} -- a different packet
+     * type from {@code ClientboundCustomPayloadPacket}, so neither handler above matches it,
+     * which is why the login phase was uncovered until now. It is also never bundled: {@code
+     * ProtocolInfoBuilder#withBundlePacket} has exactly one caller in the whole game
+     * ({@code GameProtocols}, play clientbound) and {@code ProtocolInfo#bundlerInfo()} is
+     * {@code @Nullable}, so the login protocol installs no {@code "bundler"} handler at all
+     * and a login query is always its own top-level pipeline message. Verified 2026-08-29
+     * over the full decompiled 1.21.11 extract; see {@code NOTES.md}, "The login phase".
+     *
+     * <p><b>A substitution, not a cancel, and this is the load-bearing decision.</b>
+     * Cancelling here would not withhold, it would stall: vanilla keeps no per-transaction
+     * accounting on either side, so a querying server -- which is blocked on that transaction
+     * and therefore sends nothing while it waits -- leaves the client receiving nothing until
+     * {@code Connection}'s own {@code ReadTimeoutHandler(30)} fires {@code disconnect.timeout}.
+     * A hang is a behaviour no vanilla client exhibits, so it would disclose more than the
+     * answer it was meant to avoid. Replacing the payload with a {@code DiscardedQueryPayload}
+     * instead makes Fabric API's {@code ClientHandshakePacketListenerImplMixin} -- which only
+     * intercepts a {@code PacketByteBufLoginQueryRequestPayload} -- skip the packet, leaving
+     * unmodified vanilla {@code handleCustomQuery} to send its unconditional
+     * {@code (transactionId, null)} answer. See {@link ExposureGuard#forceVanillaLoginAnswer}
+     * for the full argument and the {@code javap} verification, and
+     * {@code .superpowers/sdd/login-phase-spike.md} for the investigation.
+     *
+     * <p>Unlike the play-phase mixin-ordering hazard that moved the inbound filter here in the
+     * first place, this does not race Fabric's mixin: the substitution happens in {@code
+     * channelRead0}, before {@code genericsFtw} dispatches to the listener at all, so Fabric's
+     * injection inside {@code handleCustomQuery} is downstream by construction rather than by
+     * priority. Fabric API's own {@code ConnectionMixin} still touches no inbound handler.
+     *
+     * <p>This and the two handlers above all attach at {@code HEAD} and their relative order is
+     * undefined, which is again fine because all three match mutually disjoint packet types: a
+     * {@code ClientboundCustomQueryPacket} is neither a {@code ClientboundBundlePacket} nor a
+     * {@code ClientboundCustomPayloadPacket}, and each returns its argument untouched when it
+     * does not match.
+     *
+     * <p><b>The snapshot here is always the globals-only one, necessarily.</b> {@code
+     * ExposureGuard.beginConnection} runs from {@code ClientCommonPacketListenerImpl}'s
+     * constructor, first reached at {@code handleLoginFinished} -- after the login phase. So
+     * {@link #cmdguard$snapshot()} returns {@link ExposureGuard#globalsOnlySnapshot()} for
+     * every login query, and per-server grants cannot apply. That is documented in the WARN
+     * line this emits, which names {@code /cmdguard expose global <namespace>} as the remedy.
+     *
+     * <p><b>Singleplayer is exempt here, and the exemption has to live in this method.</b>
+     * {@code ExposureGuard.snapshotFor} switches {@code active} off for {@link
+     * ExposureGuard#SINGLEPLAYER_KEY} -- a local world's connection runs between the client
+     * and the integrated server in the same JVM, so there is no remote party and nothing to
+     * withhold from. But the login phase necessarily runs on {@link
+     * ExposureGuard#globalsOnlySnapshot()} (see the paragraph above), whose {@code active} is
+     * plain {@code exposureActive()} with no singleplayer exemption in it -- and singleplayer
+     * does run a full handshake through this very method, since {@code
+     * Connection#connectToLocalServer} builds an ordinary {@code Connection} and the
+     * integrated server runs the real login protocol over it. Without this check, a
+     * server-side mod using {@code ServerLoginConnectionEvents.QUERY_START} on the
+     * <em>integrated</em> server would have its own query withheld from the same process, for
+     * zero privacy benefit -- and if that handshake is load-bearing, the local world fails to
+     * load, with a WARN telling the player to expose a namespace to themselves.
+     *
+     * <p>{@link #isMemoryConnection()} is the right test and not merely a convenient one: it
+     * is true for exactly the in-process channel, so a LAN <em>host</em> (which is still this
+     * same integrated-server connection) is exempt and a LAN <em>join</em> (a real socket to
+     * another machine) stays filtered -- matching the per-server behaviour {@code
+     * snapshotFor} documents and the README describes. It also cannot throw or NPE: {@code
+     * Connection#channel} is assigned in {@code channelActive}, which fires before any read,
+     * and a null channel would fail the two {@code instanceof} tests and return false, i.e.
+     * keep filtering on.
+     */
+    @ModifyVariable(method = "channelRead0(Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;)V",
+            at = @At("HEAD"), argsOnly = true, ordinal = 0)
+    private Packet<?> cmdguard$forceVanillaLoginAnswer(Packet<?> packet) {
+        if (getReceiving() != PacketFlow.CLIENTBOUND
+                || !(packet instanceof ClientboundCustomQueryPacket query)
+                || isMemoryConnection()) {
+            return packet;
+        }
+        return ExposureGuard.forceVanillaLoginAnswer(query, cmdguard$snapshot());
     }
 }

@@ -1,7 +1,7 @@
 # CmdGuard: client metadata exposure whitelist
 
 Date: 2026-08-29
-Status: design approved, implementation not started
+Status: implemented, plus the login-phase extension recorded below (never run in a game)
 Target: Minecraft 1.21.11, Fabric Loader 0.19.3, Fabric API 0.141.6+1.21.11, Mojang mappings
 
 ## Problem
@@ -27,7 +27,9 @@ below is subordinate to them.
 - `minecraft:brand` is untouched and truthful. The client does not claim to be vanilla.
 - Never fabricate. No channel is ever advertised that the client did not register; no
   identifier is ever sent that the client does not actually have.
-- Behavioural fingerprinting (timing, capability, tab-completion text) is out of scope.
+- Behavioural fingerprinting (timing, capability) is out of scope. Tab-completion *text*
+  no longer is: it is guarded by the command allowlist — see "The tab-completion
+  suggestion guard" below.
 
 Withholding is silence. Fabrication is a lie. This feature does the first and never the
 second.
@@ -141,6 +143,62 @@ in `NOTES.md`:
   withheld custom-payload sub-packets removed — removal only, never a dropped
   non-payload sub-packet, and never a cancelled bundle.
 
+### The login phase
+
+An earlier draft of this spec scoped the login phase out, and the README and `NOTES.md`
+said so. That is no longer true: it is covered, at the same `Connection#channelRead0`
+`@ModifyVariable` the bundle filter uses. The investigation is
+`.superpowers/sdd/login-phase-spike.md`; `NOTES.md`, "The login phase", carries the
+verification.
+
+The login phase uses a different pair of packets — `ClientboundCustomQueryPacket` inbound,
+`ServerboundCustomQueryAnswerPacket` outbound — so neither `instanceof` above matches it.
+It matters because Fabric's `ClientLoginNetworking` lets a mod answer a query where vanilla
+answers `null`, and **answering at all is the disclosure**: one login query on a mod's
+channel tells the server whether the client has it.
+
+Outbound filtering is impossible: `CustomQueryAnswerPayload` declares only
+`write(FriendlyByteBuf)` — no `id()` — and the packet's wire format is a transaction-id
+varint plus `writeNullable`, so no channel id ever leaves and none can be recovered at
+`sendPacket`. **The decision must be made inbound.**
+
+Cancelling inbound is not the answer either, and this was refuted rather than assumed:
+nothing in vanilla does per-transaction accounting, so an unanswered query is not refused,
+it stalls until `Connection`'s `ReadTimeoutHandler(30)` fires `disconnect.timeout`. A hang
+is a behaviour no vanilla client exhibits, so it discloses more than an answer does.
+
+**So the query is substituted, not dropped.** A `ClientboundCustomQueryPacket` on a
+withheld channel is replaced with
+`new ClientboundCustomQueryPacket(txid, new DiscardedQueryPayload(id))` — both constructors
+public and `javap`-verified. Fabric's `ClientHandshakePacketListenerImplMixin` only
+intercepts a `PacketByteBufLoginQueryRequestPayload`, so it skips the substituted packet and
+vanilla's unconditional `new ServerboundCustomQueryAnswerPacket(txid, null)` stands. Nothing
+is cancelled, no packet this mod constructs goes on the wire, and the transaction id is
+preserved.
+
+This stays on the withholding side of the hard boundary. A `null` answer is the protocol's
+own encoding of "there is no payload" (the component is `@Nullable`, written with
+`writeNullable`); it carries zero identifiers; it is vanilla's unconditional behaviour
+rather than a pose; Fabric's own API emits a byte-identical packet when a handler declines;
+and it is the same act as omitting a channel from `minecraft:register`, one phase earlier.
+
+**Per-server grants cannot apply, structurally.** `beginConnection` runs from
+`ClientCommonPacketListenerImpl`'s constructor, first reached at `handleLoginFinished` —
+after the login queries. So the login filter necessarily uses the globals-only snapshot,
+and the remedy for a login it breaks is `/cmdguard expose global <namespace>` plus a
+reconnect, **not** the per-server form. A user handed the per-server command watches it
+fail and concludes the mod is broken, so the documentation and the log line both name the
+global form explicitly.
+
+**The failure mode is worse here than elsewhere.** A server whose handshake genuinely needs
+a real answer refuses the join, and it surfaces as the *server's* disconnect screen with
+nothing pointing at CmdGuard. Every substitution therefore logs at **WARN**, naming the
+channel and the exact remedy command; `latest.log` is the only surface that survives. The
+ledger is deliberately not written from this path, since `beginConnection` resets it after
+the login phase and an entry would be wiped before anyone could read it. The behaviour has
+its own toggle, `filterLogin`, default on, so it can be switched off without giving up the
+rest of the layer.
+
 ### Outcomes per outbound custom payload
 
 | Payload | Action |
@@ -199,6 +257,10 @@ Pure, no Minecraft imports, unit-testable without a client:
   from the input. Every rewrite is expressed as one call to this.
 - `ChannelLedger` - the record of channels observed and their last decision. Persisted,
   read by `/cmdguard exposure`, and never consulted by the filter.
+- `LoginQueryFilter` - the login-phase decision as a pure function of a channel id, the two
+  switches and a policy, plus the namespace the remedy command must name. Withholds on a
+  null or malformed id, a null policy and any throw. Kept separate from `ExposureGuard` so
+  the one decision that can cost a player their join is unit-testable without a client.
 
 Minecraft-facing, kept thin:
 
@@ -210,8 +272,11 @@ Minecraft-facing, kept thin:
   `rewriteOrSame`/`filterBundle` return the packet unchanged or a rewritten/rebuilt one --
   never null, there is nothing here to cancel a packet by returning null. Holds the
   connection's policy snapshot and feeds the ledger.
-- `ConnectionMixin` - both directions, outbound and inbound, the latter including the
-  packet-bundle unwrapping `filterBundle` needs (see `NOTES.md`, "Inbound: packet bundles").
+- `ConnectionMixin` - both directions, outbound and inbound, the latter with three handlers
+  on one method because one pipeline message is not one packet of one type: a bare
+  clientbound payload is cancelled, a bundle is rebuilt without its withheld sub-payloads
+  (see `NOTES.md`, "Inbound: packet bundles"), and a login query has its payload substituted
+  (see "The login phase" above).
   `ClientPacketListenerMixin` is unrelated to exposure: it holds the outbound
   `sendCommand`/`sendUnattendedCommand` guard from the command-blocking feature.
 
@@ -276,7 +341,11 @@ Fail closed, and never fail silently.
   cannot pretend to guard - but a green build, in CI or locally, is not evidence that any
   mixin target is correct. Only running the game proves that, which makes the manual
   acceptance run the sole check on every mapped signature this mod depends on.
-- A throw inside the policy withholds.
+- A throw inside the policy withholds. In the login phase that means substituting rather
+  than dropping, since dropping there is a stall, not a withhold.
+- A withheld login answer is logged at **WARN**, not INFO, and names the remedy command.
+  Unlike every other withhold, the consequence can be that the player cannot join at all,
+  and the disconnect they see comes from the server with no mention of CmdGuard on it.
 - Join-time chat line reports the counts: exposed, withheld.
 - `/cmdguard exposure` lists every channel in the ledger as EXPOSED or WITHHELD with the
   withheld-payload count, and survives a disconnect so it can be read after a kick.
@@ -307,6 +376,13 @@ and a kick leaves no chat to write to - so the withheld set for a connection mus
 its disconnect, be logged, and be readable afterwards via `/cmdguard exposure` so the
 user can see what was withheld rather than guess.
 
+**The login phase is the sharp edge of that same cost.** A server whose handshake needs a
+real login answer - a proxy's forwarding handshake is the obvious case - refuses the
+connection outright, and the user never reaches a state where `/cmdguard exposure` can be
+run. The remedy is `/cmdguard expose global <namespace>` (global, not per-server: see "The
+login phase") plus a reconnect, and the WARN line in `latest.log` is the only place that
+remedy is discoverable from.
+
 ## Documentation changes
 
 `ChannelAudit`'s class javadoc currently argues the opposite position - that suppressing
@@ -332,7 +408,19 @@ refinements; `IdentifierFilter`; a test asserting `minecraft:brand` is never wit
 a test asserting the filter never emits an entry absent from its input (the
 no-fabrication boundary, enforced by code rather than intent); a test asserting the
 advertisement/enforcement invariant - every channel the filter would strip from a
-registration is one the policy also withholds in both directions.
+registration is one the policy also withholds in both directions; `LoginQueryFilter`,
+including that the login decision agrees channel-for-channel with the rest of the layer
+(the same invariant carried into the login phase), that both switches are checked before
+anything can fail, and that a null id, a malformed id and a null policy each withhold; and
+that an `exposure` block written before `filterLogin` existed loads with login filtering
+**on** rather than off - asserted by parsing that JSON through Gson, not by setting fields
+by hand, because the earlier hand-built tests all agreed with an untested premise (that
+Gson leaves an absent field null) and the premise was false: Gson assigns only the fields
+the JSON names and constructs through the implicit no-arg constructor, so every field
+initializer runs. The same round-trip test is the standing guard for the hazard that is
+real - giving `ExposureSettings` or `GuardConfig` a constructor with arguments deletes that
+implicit constructor, sends Gson down `Unsafe.allocateInstance`, and silently loads every
+primitive in the class as `false`.
 
 Not covered: mixins and Minecraft-facing code. There is no Minecraft client on the build
 machine. This is a real gap, stated rather than papered over.
@@ -350,11 +438,89 @@ minimum that must be run once by hand before this is called done:
 4. `/cmdguard expose <namespace>` for one withheld mod, reconnect, confirm the count drops
    and that namespace now reads EXPOSED.
 5. Confirm the command guard and `/cmdguard audit` still behave as before.
+6. The login-phase substitution needs its own rig, because vanilla never sends a login
+   query at all - a repo-wide grep of the decompiled sources finds zero
+   `new ClientboundCustomQueryPacket`. The spike's "What in-game acceptance would look
+   like" section describes it: a small server-side Fabric mod that sends one login query on
+   a known channel and logs whether an answer arrived and whether its payload was null,
+   then four client runs - vanilla (answer, null), a mod with a login handler and no
+   CmdGuard (answer, non-null), the same plus CmdGuard withholding (answer, null,
+   byte-identical to the first), and the same plus CmdGuard exposing (identical to the
+   second). The assertion is on the *server's* log; "the client connected fine" does not
+   distinguish a null answer from a real one.
 
 A packet capture of the configuration phase, if the tester can take one, is the only
 direct evidence that no withheld identifier reached the wire.
 
+## The tab-completion suggestion guard
+
+Listed here as out of scope until 2026-08-29, on the reasoning that it was a separate
+feature with a separate mechanism. Half of that was wrong, and it is now implemented.
+
+**The leak.** `ClientSuggestionProvider#customSuggestion` sends
+`new ServerboundCommandSuggestionPacket(i, commandContext.getInput())` — the partial
+command, truncated at the cursor — the moment tab completion runs. The command guard
+blocks `/somemod:debug` on the way to `sendCommand`; without this, the same text left the
+client one keystroke earlier as a completion request.
+
+**Not a separate mechanism.** The packet goes out through `ClientPacketListener#send`,
+which is a one-line delegation to `Connection#send` and hence to `Connection#sendPacket`
+— the outbound choke point this design already hooks for the exposure layer. So the guard
+is one more `@Inject` on the existing `ConnectionMixin`, not a new mixin and not a new
+interception point. Verified against the decompiled 1.21.11 sources and, for the
+accessors (`getId()` / `getCommand()`; it is a class, not a record), `javap` over the
+mapped merged jar. See `NOTES.md`, "Outbound: tab-completion requests".
+
+**It is a separate *policy* surface, though, and stays separate.** This is the command
+guard's rule, not the exposure whitelist's: `SuggestionFilter` reads `GuardConfig.allowlist`
+and nothing else. A suggestion request is judged by exactly the rule that governs the
+command it would become — one list, so the two can never disagree. The exposure policy is
+not consulted, and the toggle lives on `GuardConfig` (`guardSuggestions`, a primitive
+`boolean` with a `true` initializer, like `enabled` and `allowClickedCommands`) rather than
+in `ExposureSettings`, because putting it there would have gated a command-guard rule behind
+`exposure.enabled`.
+
+**The partial-root decision.** A partial command may not have a complete root yet: `/ms`
+has root `ms`, which is not on the allowlist even though the user is heading for `/msg`.
+It is withheld. The alternative — a prefix rule — would send every prefix of an allowlisted
+root to the server, i.e. leak the keystrokes the guard exists to protect. The cost is that a
+command *name* cannot be completed against the server, only its arguments; the README states
+this in those words rather than leaving a user to discover it. The cost is smaller than it
+reads: command names are completed locally from the client's copy of the command tree, and
+only an *argument* node that asks the server produces this packet at all. The rule is still
+enforced strictly, because the command tree is server-supplied and a server could put an
+asks-the-server argument node directly under the root.
+
+**Edges, decided rather than defaulted.**
+
+- *Empty input* (`""`, or `"/"` alone) — withheld. `OutboundGuard#shouldBlock` lets an
+  empty root through because an empty command sends nothing; here the text is on the wire
+  either way, so it is judged, and an empty root is on no allowlist.
+- *No leading slash* — judged as a command anyway. Plain chat suggestions never reach this
+  packet (`CommandSuggestions#updateCommandInfo` serves them from a local player-name list),
+  so slashless text here comes from `AbstractCommandBlockEditScreen`, where it *is* a
+  command. Vanilla's `handleCustomCommandSuggestions` strips an optional `/` for the same
+  reason; `CommandRoot.of` matches it.
+- *A root the client handles locally* — **not** exempt, unlike on the typed-command path.
+  A client command never reaches the network when run, but its completion request does, and
+  `NOTES.md`'s leak vector #3 is exactly a client mod hanging `ASK_SERVER` on its own
+  argument. Exempting client roots would wave through the case this is best placed to catch.
+
+**Failure behaviour.** Fail closed, like everything else here: an exception while deciding
+cancels the send. The `instanceof` sits outside the `try`, so a fail-closed cancel can only
+ever drop a suggestion request, never an unrelated packet. Cancelling is safe — the
+`CompletableFuture` `customSuggestion` returned is only ever read behind an `isDone()` check
+in `CommandSuggestions`, so an uncompleted one leaves the popup empty and is cancelled by the
+next keystroke. No chat message is emitted (a request per keystroke would bury the chat, and
+this can run on the netty event loop); one INFO line per withheld root goes to `latest.log`.
+
+**Testing.** `SuggestionFilter` and `CommandRoot` are Minecraft-free and unit-tested:
+allowlisted root, non-allowlisted root, partial root, empty, slashless text, both switches
+off, a null allowlist and an allowlist that throws (both fail closed), strict mode, and the
+invariant that the suggestion decision agrees with the command decision on the same
+allowlist. The mixin binding itself is launch-time and remains untested, as elsewhere.
+
 ## Out of scope
 
-The tab-completion suggestion guard (`ServerboundCommandSuggestionPacket` sends partial
-command text before you press enter). Separate feature, separate mechanism.
+Behavioural fingerprinting: timing, capability probing, and what the client's *behaviour*
+reveals as opposed to what it says.

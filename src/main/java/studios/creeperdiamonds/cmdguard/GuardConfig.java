@@ -21,8 +21,24 @@ import java.util.Set;
  */
 public final class GuardConfig {
     private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
-    private static final Path PATH =
-            FabricLoader.getInstance().getConfigDir().resolve("cmdguard.json");
+
+    /**
+     * Resolved on each use rather than held in a static field.
+     *
+     * <p>It used to be a {@code static final Path} initialised from {@code
+     * FabricLoader.getInstance().getConfigDir()}, which meant merely <em>mentioning</em> this
+     * class ran that call -- and outside a launched game it throws, taking the whole class
+     * initialisation with it as an {@code ExceptionInInitializerError}. That put the shape of
+     * this class out of reach of a plain unit test, which is how the {@code filterLogin}
+     * migration ended up asserted only by hand-built objects and against a premise nothing had
+     * ever run through Gson. {@code ExposureSettingsTest}'s round-trip test parses real JSON
+     * into a {@code GuardConfig}, and can only do that because this class no longer needs a
+     * game to be class-loaded. {@code FabricLoader} caches the config directory, so resolving
+     * it per call costs nothing.
+     */
+    private static Path path() {
+        return FabricLoader.getInstance().getConfigDir().resolve("cmdguard.json");
+    }
 
     /**
      * Starter allowlist. A pure empty default-deny locks you out of auth servers --
@@ -44,6 +60,29 @@ public final class GuardConfig {
      * breaks server GUIs, so they are permitted by default.
      */
     public boolean allowClickedCommands = true;
+
+    /**
+     * Judge tab-completion requests by the same allowlist as the commands they would become.
+     *
+     * <p>Lives here rather than in {@code ExposureSettings} because it gates a rule about the
+     * <em>command</em> allowlist, not about channel exposure: {@link SuggestionFilter} reads
+     * {@link #allowlist} and nothing else. Putting it next to the exposure toggles would have
+     * put a command-guard switch behind {@code exposure.enabled}, which governs a different
+     * feature entirely.
+     *
+     * <p>A plain {@code boolean} with an initializer, matching {@link #enabled} and
+     * {@link #allowClickedCommands}. Gson never assigns a field the JSON does not name, and
+     * it constructs this class through the implicit public no-arg constructor
+     * ({@code ConstructorConstructor} prefers a declared no-arg constructor and only falls
+     * back to {@code Unsafe} when there is none), so every field initializer runs and a config
+     * written before this field existed keeps {@code true} -- the guarded direction. Do not
+     * give this class a constructor with arguments: that would delete the implicit no-arg one,
+     * send Gson down the {@code Unsafe.allocateInstance} path, and silently turn every
+     * primitive in here to {@code false} and every set to {@code null} on load. {@code
+     * ExposureSettingsTest#anOldConfigParsedByGsonKeepsEveryFlagOn} parses real JSON into this
+     * class and is the standing guard against exactly that.
+     */
+    public boolean guardSuggestions = true;
 
     public Set<String> allowlist = new LinkedHashSet<>(STARTER_ALLOWLIST);
 
@@ -75,8 +114,9 @@ public final class GuardConfig {
     }
 
     private static GuardConfig load() {
-        if (Files.exists(PATH)) {
-            try (Reader reader = Files.newBufferedReader(PATH, StandardCharsets.UTF_8)) {
+        Path path = path();
+        if (Files.exists(path)) {
+            try (Reader reader = Files.newBufferedReader(path, StandardCharsets.UTF_8)) {
                 GuardConfig loaded = GSON.fromJson(reader, GuardConfig.class);
                 if (loaded != null) {
                     if (loaded.allowlist == null) {
@@ -99,8 +139,9 @@ public final class GuardConfig {
 
     public void save() {
         try {
-            Files.createDirectories(PATH.getParent());
-            try (Writer writer = Files.newBufferedWriter(PATH, StandardCharsets.UTF_8)) {
+            Path path = path();
+            Files.createDirectories(path.getParent());
+            try (Writer writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
                 GSON.toJson(this, writer);
             }
         } catch (IOException e) {
