@@ -3,6 +3,7 @@ package studios.creeperdiamonds.cmdguard;
 import com.google.gson.Gson;
 import com.google.gson.GsonBuilder;
 import net.fabricmc.loader.api.FabricLoader;
+import studios.creeperdiamonds.cmdguard.exposure.ExposureSettings;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -46,9 +47,27 @@ public final class GuardConfig {
 
     public Set<String> allowlist = new LinkedHashSet<>(STARTER_ALLOWLIST);
 
-    private static GuardConfig instance;
+    public ExposureSettings exposure = new ExposureSettings();
 
-    public static GuardConfig get() {
+    // Read from the netty event loop (ConnectionMixin's lazy fallback, ExposureGuard's
+    // snapshot builders) as well as the client thread, so a plain field is not enough to
+    // guarantee the write is visible.
+    private static volatile GuardConfig instance;
+
+    /**
+     * The single config instance, loading it on first use.
+     *
+     * <p>{@code synchronized} because this is now read from the netty event loop as well as
+     * the client thread. {@code CmdGuardClient#onInitializeClient} warms it eagerly, long
+     * before any connection exists, so in practice the lazy branch runs exactly once on the
+     * client thread -- but "in practice the eager warm-up always wins" is an ordering
+     * assumption, not a guarantee, and an unsynchronised check-then-act here would let two
+     * threads both see null, both run {@link #load()}, and both write. The loser's instance
+     * would then be silently discarded while some caller still held a reference to it, so
+     * a {@code /cmdguard expose} written through that reference would be saved to disk and
+     * then never read back. The cost of the lock is one uncontended acquire per call.
+     */
+    public static synchronized GuardConfig get() {
         if (instance == null) {
             instance = load();
         }
@@ -63,6 +82,10 @@ public final class GuardConfig {
                     if (loaded.allowlist == null) {
                         loaded.allowlist = new LinkedHashSet<>();
                     }
+                    if (loaded.exposure == null) {
+                        loaded.exposure = new ExposureSettings();
+                    }
+                    loaded.exposure.normalise();
                     return loaded;
                 }
             } catch (IOException | RuntimeException e) {
@@ -83,6 +106,20 @@ public final class GuardConfig {
         } catch (IOException e) {
             CmdGuardClient.LOGGER.error("[cmdguard] could not save config", e);
         }
+    }
+
+    /**
+     * Whether the exposure layer is actually filtering anything.
+     *
+     * <p>{@link #enabled} is the guard's master switch and gates the exposure layer too, so
+     * {@code /cmdguard off} silently stops exposure filtering as well. Everything that
+     * reports exposure state to the user -- the config screen, {@code /cmdguard status},
+     * {@code /cmdguard exposure}, the join-time line -- must ask this rather than
+     * {@code exposure.enabled}, or it will claim the whitelist is on while nothing is being
+     * withheld. This method is the single place that conjunction lives.
+     */
+    public boolean exposureActive() {
+        return enabled && exposure.enabled;
     }
 
     public boolean allow(String root) {

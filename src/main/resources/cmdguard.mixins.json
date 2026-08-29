@@ -4,7 +4,9 @@
   "package": "studios.creeperdiamonds.cmdguard.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "ClientPacketListenerMixin"
+    "ClientCommonPacketListenerImplMixin",
+    "ClientPacketListenerMixin",
+    "ConnectionMixin"
   ],
   "injectors": {
     "defaultRequire": 1
