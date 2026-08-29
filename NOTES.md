@@ -374,6 +374,29 @@ public PacketFlow getSending()   { return this.receiving.getOpposite(); }
 `public PacketFlow getOpposite()`. On a client connection `getSending()` is `SERVERBOUND`.
 The mixin must test it, because `Connection` is shared by both sides.
 
+**In-process-channel accessor, the `ConnectionMixin.java:117-118` `@Shadow` for the
+singleplayer login exemption:**
+
+```
+public boolean isMemoryConnection()
+    descriptor: ()Z
+```
+
+```java
+public boolean isMemoryConnection() {
+    return this.channel instanceof LocalChannel || this.channel instanceof LocalServerChannel;
+}
+```
+
+Verified 2026-08-29 the same two ways as the rest of this section. The decompiled source
+above is copied unedited from the `genSources` sources jar; `javap -p -s -c` over the
+mapped merged jar shows the same two-branch `instanceof` test against the `channel` field
+(`Lio/netty/channel/Channel;`) — `LocalChannel` then `LocalServerChannel`, `ior`-ed via
+`ifne`/`ifeq` into `iconst_1`/`iconst_0` — so the bytecode and the source agree line for
+line with no third branch and nothing else read. This is what
+`cmdguard$forceVanillaLoginAnswer`'s singleplayer exemption rests on entirely, so it is
+recorded here rather than left to stand on its own Javadoc's word.
+
 **Everything client-side really does reach the funnel.** Read, not assumed:
 
 - `ClientCommonPacketListenerImpl#send(Packet<?>)` —
