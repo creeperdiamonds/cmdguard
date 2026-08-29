@@ -82,7 +82,9 @@ public final class CmdGuardCommands {
                         : Component.literal("OFF").withStyle(ChatFormatting.RED))
                 .append(Component.literal("  (" + config.allowlist.size()
                         + " allowlisted, clicked commands "
-                        + (config.allowClickedCommands ? "allowed" : "blocked") + ")")
+                        + (config.allowClickedCommands ? "allowed" : "blocked")
+                        + ", tab completion "
+                        + (config.guardSuggestions ? "allowlist only" : "unrestricted") + ")")
                         .withStyle(ChatFormatting.GRAY)));
 
         // The exposure layer is gated on config.enabled too, so /cmdguard off turns it off

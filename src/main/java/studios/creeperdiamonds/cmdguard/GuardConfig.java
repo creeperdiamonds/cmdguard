@@ -45,6 +45,27 @@ public final class GuardConfig {
      */
     public boolean allowClickedCommands = true;
 
+    /**
+     * Judge tab-completion requests by the same allowlist as the commands they would become.
+     *
+     * <p>Lives here rather than in {@code ExposureSettings} because it gates a rule about the
+     * <em>command</em> allowlist, not about channel exposure: {@link SuggestionFilter} reads
+     * {@link #allowlist} and nothing else. Putting it next to the exposure toggles would have
+     * put a command-guard switch behind {@code exposure.enabled}, which governs a different
+     * feature entirely.
+     *
+     * <p>A plain {@code boolean} with an initializer, matching {@link #enabled} and
+     * {@link #allowClickedCommands}. Gson never assigns a field the JSON does not name, and
+     * it constructs this class through the implicit public no-arg constructor
+     * ({@code ConstructorConstructor} prefers a declared no-arg constructor and only falls
+     * back to {@code Unsafe} when there is none), so every field initializer runs and a config
+     * written before this field existed keeps {@code true} -- the guarded direction. Do not
+     * give this class a constructor with arguments: that would delete the implicit no-arg one,
+     * send Gson down the {@code Unsafe.allocateInstance} path, and silently turn every
+     * primitive in here to {@code false} and every set to {@code null} on load.
+     */
+    public boolean guardSuggestions = true;
+
     public Set<String> allowlist = new LinkedHashSet<>(STARTER_ALLOWLIST);
 
     public ExposureSettings exposure = new ExposureSettings();

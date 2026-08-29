@@ -7,9 +7,9 @@ import net.minecraft.network.chat.Component;
 /**
  * Minimal settings screen reached from Mod Menu. The command allowlist is edited via
  * /cmdguard allow|deny and the exposure whitelist's namespaces via /cmdguard
- * expose|withhold, so this only surfaces the five toggles (guard, clicked-command
- * policy, exposure whitelist, inbound-probe filtering, login-query filtering) plus a
- * channel audit button.
+ * expose|withhold, so this only surfaces the six toggles (guard, clicked-command
+ * policy, tab-completion guard, exposure whitelist, inbound-probe filtering, login-query
+ * filtering) plus a channel audit button.
  *
  * <p>Every toggle rebuilds the whole screen rather than relabelling its own button, because
  * the guard's master switch also gates the exposure layer: the two exposure labels depend on
@@ -49,11 +49,19 @@ public final class ConfigScreen extends Screen {
                 }).bounds(centerX - 100, y + 24, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
+                suggestionLabel(config),
+                button -> {
+                    config.guardSuggestions = !config.guardSuggestions;
+                    config.save();
+                    this.rebuildWidgets();
+                }).bounds(centerX - 100, y + 48, 200, 20).build());
+
+        this.addRenderableWidget(Button.builder(
                 Component.literal("Audit mod channels (chat)"),
                 button -> {
                     ChannelAudit.report();
                     this.onClose();
-                }).bounds(centerX - 100, y + 48, 200, 20).build());
+                }).bounds(centerX - 100, y + 72, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
                 exposureLabel(config),
@@ -61,7 +69,7 @@ public final class ConfigScreen extends Screen {
                     config.exposure.enabled = !config.exposure.enabled;
                     config.save();
                     this.rebuildWidgets();
-                }).bounds(centerX - 100, y + 72, 200, 20).build());
+                }).bounds(centerX - 100, y + 96, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
                 inboundLabel(config),
@@ -69,7 +77,7 @@ public final class ConfigScreen extends Screen {
                     config.exposure.filterInbound = !config.exposure.filterInbound;
                     config.save();
                     this.rebuildWidgets();
-                }).bounds(centerX - 100, y + 96, 200, 20).build());
+                }).bounds(centerX - 100, y + 120, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
                 loginLabel(config),
@@ -77,11 +85,31 @@ public final class ConfigScreen extends Screen {
                     config.exposure.filterLogin = !config.exposure.loginFilterEnabled();
                     config.save();
                     this.rebuildWidgets();
-                }).bounds(centerX - 100, y + 120, 200, 20).build());
+                }).bounds(centerX - 100, y + 144, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
                 Component.literal("Done"),
-                button -> this.onClose()).bounds(centerX - 100, y + 156, 200, 20).build());
+                button -> this.onClose()).bounds(centerX - 100, y + 180, 200, 20).build());
+    }
+
+    /**
+     * The tab-completion toggle. Worded as what happens rather than as a switch name, for the
+     * same reason as {@link #loginLabel}: this is the toggle with a visible everyday cost. On,
+     * a command name cannot be completed against the server and neither can the arguments of
+     * any command that is not on the allowlist -- pressing Tab simply shows nothing. That is
+     * the correct trade (a completion request puts the partial command on the wire exactly as
+     * running it would), but a user who meets it without being told concludes their chat is
+     * broken.
+     *
+     * <p>Gated on {@code config.enabled} like the exposure labels, since the guard's master
+     * switch turns this off too.
+     */
+    private static Component suggestionLabel(GuardConfig config) {
+        String state = config.guardSuggestions ? "allowlist only" : "unrestricted";
+        if (!config.enabled) {
+            return Component.literal("Tab completion: " + state + " (inactive, guard off)");
+        }
+        return Component.literal("Tab completion: " + state);
     }
 
     /**

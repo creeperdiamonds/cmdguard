@@ -7,6 +7,7 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.game.ClientboundBundlePacket;
+import net.minecraft.network.protocol.game.ServerboundCommandSuggestionPacket;
 import net.minecraft.network.protocol.login.ClientboundCustomQueryPacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
@@ -16,6 +17,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import studios.creeperdiamonds.cmdguard.CmdGuardClient;
+import studios.creeperdiamonds.cmdguard.OutboundGuard;
 import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
 
 import java.util.concurrent.atomic.AtomicReference;
@@ -62,6 +64,14 @@ import java.util.concurrent.atomic.AtomicReference;
  * but touches no inbound handler method, so there is nothing here to race with. This is the
  * same argument that put the outbound filter on {@code sendPacket} rather than on a public
  * {@code send} overload.
+ *
+ * <p><b>Two outbound concerns, not one.</b> This class began as the exposure layer's choke
+ * point, but {@code sendPacket} is where <em>every</em> serverbound packet passes, so the
+ * command guard's tab-completion half lives here too -- a
+ * {@code ServerboundCommandSuggestionPacket} carries the partial command and reaches this
+ * method through {@code ClientPacketListener#send}. It is judged by the command allowlist, not
+ * by the exposure policy; the two never consult each other. See
+ * {@link #cmdguard$guardSuggestionRequest}.
  *
  * <p><b>Three inbound handlers, not one</b>, because "one pipeline message" is not "one
  * packet of one type": a bare {@code ClientboundCustomPayloadPacket} is cancelled, a
@@ -194,6 +204,66 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
                                        CallbackInfo ci) {
         if (getSending() == PacketFlow.SERVERBOUND
                 && ExposureGuard.shouldDrop(packet, cmdguard$snapshot())) {
+            ci.cancel();
+        }
+    }
+
+    /**
+     * The command guard's second half: tab completion, which leaks the same text one step
+     * earlier than running the command does.
+     *
+     * <p>{@code ClientPacketListenerMixin} guards {@code sendCommand} and {@code
+     * sendUnattendedCommand}, so a command whose root is not allowlisted never leaves the
+     * client. But pressing Tab sends the partial text first:
+     * {@code ClientSuggestionProvider#customSuggestion} does
+     * {@code this.connection.send(new ServerboundCommandSuggestionPacket(i,
+     * commandContext.getInput()))}, and {@code ClientCommonPacketListenerImpl#send(Packet)} is
+     * a one-line {@code this.connection.send(packet)} into {@code Connection#send}, which
+     * calls {@code sendPacket}. So the request already passes through this very choke point
+     * and the guard needs no mixin of its own -- only this handler. Verified 2026-08-29
+     * against the decompiled 1.21.11 sources and, for the accessors, {@code javap} over the
+     * mapped merged jar; see {@code NOTES.md}, "Outbound: tab-completion requests".
+     *
+     * <p>The decision is {@link OutboundGuard#shouldBlockSuggestion}, which defers to the
+     * Minecraft-free, unit-tested {@code SuggestionFilter}. It reuses the command allowlist:
+     * a completion request is judged by the same rule as the command it would become.
+     *
+     * <p><b>Cancelling is safe, and this was read rather than assumed.</b> {@code
+     * customSuggestion} has already created {@code pendingSuggestionsFuture} and returned it
+     * to {@code CommandSuggestions}, which stores it in {@code pendingSuggestions}. Every read
+     * of that field in {@code CommandSuggestions} is guarded by {@code isDone()} -- the render
+     * path checks it explicitly, and {@code updateUsageInfo} (the only other {@code join()})
+     * runs solely from the {@code thenRun} callback -- so a future that never completes leaves
+     * the suggestion popup empty and nothing else. The next keystroke's {@code
+     * customSuggestion} call cancels it outright. No hang, no leak, no exception.
+     *
+     * <p>Fail closed: an exception while deciding cancels the send rather than letting the
+     * request out. The {@code instanceof} and the flow check sit outside the {@code try} on
+     * purpose, exactly as in {@link #cmdguard$dropWithheldInbound}, so a fail-closed cancel
+     * can only ever drop a suggestion request and never some unrelated packet.
+     *
+     * <p>This and {@link #cmdguard$dropWithheld} both attach at {@code HEAD} of {@code
+     * sendPacket} and their relative order is undefined, which is fine because they match
+     * disjoint packet types: a {@code ServerboundCommandSuggestionPacket} is not a {@code
+     * ServerboundCustomPayloadPacket}. Same pairing argument as the three inbound handlers.
+     */
+    @Inject(method = "sendPacket(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
+            at = @At("HEAD"), cancellable = true)
+    private void cmdguard$guardSuggestionRequest(Packet<?> packet,
+                                                 ChannelFutureListener listener,
+                                                 boolean flush,
+                                                 CallbackInfo ci) {
+        if (getSending() != PacketFlow.SERVERBOUND
+                || !(packet instanceof ServerboundCommandSuggestionPacket suggestion)) {
+            return;
+        }
+        try {
+            if (OutboundGuard.shouldBlockSuggestion(suggestion.getCommand())) {
+                ci.cancel();
+            }
+        } catch (RuntimeException e) {
+            CmdGuardClient.LOGGER.error(
+                    "[cmdguard] suggestion guard check failed, withholding the request", e);
             ci.cancel();
         }
     }
