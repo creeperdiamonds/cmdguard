@@ -187,8 +187,9 @@ public final class CmdGuardCommands {
         }
 
         long exposed = entries.stream().filter(ChannelLedger.Entry::exposed).count();
+        // As in expose(): a null key on a live connection means a transfer and nothing else.
         String server = connectionSnapshot == null || connectionSnapshot.serverKey() == null
-                ? "no per-server identity"
+                ? "a transferred connection (global grants only)"
                 : connectionSnapshot.serverKey();
 
         feedback(ctx, Component.literal("CmdGuard exposure on " + server + ": ")
@@ -227,10 +228,14 @@ public final class CmdGuardCommands {
         ExposureGuard.Snapshot snapshot = ExposureGuard.currentSnapshot();
         String server = snapshot == null ? null : snapshot.serverKey();
 
+        // A null server key now means exactly one thing. Singleplayer gets the real reserved
+        // "singleplayer" key, and the pre-handshake window is not reachable by a typed
+        // command, so the only connection that reaches this branch is a transferred one.
         if (!global && server == null) {
             feedback(ctx, Component.literal(
-                            "No per-server identity for this connection (singleplayer, or a transfer). "
-                                    + "Use /cmdguard expose global " + value + " to allow it everywhere.")
+                            "This connection was reached by a server transfer, so it gets global "
+                                    + "grants only and has no per-server identity. Use /cmdguard expose global "
+                                    + value + " to allow it everywhere.")
                     .withStyle(ChatFormatting.YELLOW));
             return 1;
         }
@@ -254,26 +259,68 @@ public final class CmdGuardCommands {
         return 1;
     }
 
+    /**
+     * {@code /cmdguard withhold <namespace>} -- the inverse of {@code expose}, but
+     * deliberately not its mirror image: {@code expose} needs an explicit {@code global}
+     * literal to touch the global set, while this drops the grant in <em>every</em> scope at
+     * once. Widening asks for the wider word; narrowing does not, because a "withhold" that
+     * quietly left a global grant standing would report success and withhold nothing, which
+     * is the one direction this feature must not fail in.
+     *
+     * <p>What it does not do is stay silent about it. The scopes it actually changed are
+     * named in the output, so "withholding X" is never a claim the player has to take on
+     * trust.
+     */
     private static int withhold(CommandContext<FabricClientCommandSource> ctx, String namespace) {
         GuardConfig config = GuardConfig.get();
         String value = namespace.toLowerCase(Locale.ROOT);
 
-        boolean removed = config.exposure.exposedNamespaces.remove(value);
+        boolean removedGlobal = config.exposure.exposedNamespaces.remove(value);
         ExposureGuard.Snapshot snapshot = ExposureGuard.currentSnapshot();
         String server = snapshot == null ? null : snapshot.serverKey();
         Set<String> perServer = server == null
                 ? null
                 : config.exposure.perServerNamespaces.get(server);
-        if (perServer != null) {
-            removed |= perServer.remove(value);
-        }
+        boolean removedPerServer = perServer != null && perServer.remove(value);
         config.save();
 
-        feedback(ctx, Component.literal(removed
-                        ? "Withholding " + value + " -- takes effect on your next connection."
-                        : value + " was not exposed")
-                .withStyle(removed ? ChatFormatting.YELLOW : ChatFormatting.GRAY));
+        if (!removedGlobal && !removedPerServer) {
+            feedback(ctx, Component.literal(value + " was not exposed -- nothing changed.")
+                    .withStyle(ChatFormatting.GRAY));
+            return 1;
+        }
+
+        feedback(ctx, Component.literal("Withholding " + value + " -- takes effect on your next connection.")
+                .withStyle(ChatFormatting.YELLOW));
+        if (removedGlobal) {
+            feedback(ctx, Component.literal("  removed the global grant (it applied on every server)")
+                    .withStyle(ChatFormatting.GRAY));
+        }
+        if (removedPerServer) {
+            feedback(ctx, Component.literal("  removed the grant for " + server)
+                    .withStyle(ChatFormatting.GRAY));
+        }
+        warnIfDefaultNamespace(ctx, value);
         return 1;
+    }
+
+    /**
+     * The three default namespaces are not ordinary grants. {@code fabric}, {@code minecraft}
+     * and {@code c} are the generic namespaces every Fabric client has -- which is exactly
+     * why they distinguish nobody and are exposed by default. Withholding one breaks joining
+     * a modded server outright: this branch's own {@code ExposureGuard.globalsOnlySnapshot}
+     * javadoc makes the same argument for why the fallback is not deny-all, because a
+     * withheld {@code minecraft:register} stops the server's registry sync.
+     */
+    private static void warnIfDefaultNamespace(CommandContext<FabricClientCommandSource> ctx, String value) {
+        if (!ExposurePolicy.DEFAULT_NAMESPACES.contains(value)) {
+            return;
+        }
+        feedback(ctx, Component.literal("Warning: " + value + " is one of the three generic "
+                        + "namespaces every Fabric client has, so withholding it hides nothing about "
+                        + "you and will break joining modded servers -- minecraft:register and the "
+                        + "Fabric registry sync ride on them. Undo with /cmdguard expose global " + value + ".")
+                .withStyle(ChatFormatting.RED));
     }
 
     /**

@@ -49,11 +49,25 @@ public final class GuardConfig {
 
     public ExposureSettings exposure = new ExposureSettings();
 
-    // Read from the netty event loop (ConnectionMixin's lazy fallback) as well as the
-    // client thread, so a plain field is not enough to guarantee the write is visible.
+    // Read from the netty event loop (ConnectionMixin's lazy fallback, ExposureGuard's
+    // snapshot builders) as well as the client thread, so a plain field is not enough to
+    // guarantee the write is visible.
     private static volatile GuardConfig instance;
 
-    public static GuardConfig get() {
+    /**
+     * The single config instance, loading it on first use.
+     *
+     * <p>{@code synchronized} because this is now read from the netty event loop as well as
+     * the client thread. {@code CmdGuardClient#onInitializeClient} warms it eagerly, long
+     * before any connection exists, so in practice the lazy branch runs exactly once on the
+     * client thread -- but "in practice the eager warm-up always wins" is an ordering
+     * assumption, not a guarantee, and an unsynchronised check-then-act here would let two
+     * threads both see null, both run {@link #load()}, and both write. The loser's instance
+     * would then be silently discarded while some caller still held a reference to it, so
+     * a {@code /cmdguard expose} written through that reference would be saved to disk and
+     * then never read back. The cost of the lock is one uncontended acquire per call.
+     */
+    public static synchronized GuardConfig get() {
         if (instance == null) {
             instance = load();
         }
