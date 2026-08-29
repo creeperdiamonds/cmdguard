@@ -44,8 +44,11 @@ public final class CmdGuardCommands {
                                         .executes(ctx -> expose(ctx,
                                                 StringArgumentType.getString(ctx, "namespace"), true))))
                         // greedyString, not word: Brigadier's unquoted-word charset excludes
-                        // ':', so word() cannot accept "somemod:handshake" at all. Channel
-                        // ids never contain a space, so greedy costs nothing here.
+                        // ':', so word() cannot accept "somemod:handshake" at all. Greedy is
+                        // NOT free, though -- it swallows the rest of the line, spaces and
+                        // all, so "my mod:hand shake" arrives at the handler as one argument.
+                        // ExposurePolicy.isWellFormedChannelId is what rejects it; see
+                        // normaliseChannel below and that method's Javadoc.
                         .then(ClientCommandManager.literal("channel")
                                 .then(ClientCommandManager.argument("channel", StringArgumentType.greedyString())
                                         .executes(ctx -> exposeChannel(ctx,
@@ -409,15 +412,24 @@ public final class CmdGuardCommands {
      * <p>Refusing a malformed id matters most for {@code withhold}: an id that can never
      * match would be stored, look right in {@code cmdguard.json}, and withhold nothing --
      * a false sense of privacy, which is the one direction this feature must not fail in.
+     *
+     * <p>{@code trim()} strips the ends only, on purpose. An id with a space in the middle
+     * -- which the {@code greedyString} argument happily delivers -- is a typo, not
+     * something to silently repair: squeezing the space out would store an id the user did
+     * not type and did not check. It is refused instead, by {@link
+     * ExposurePolicy#isWellFormedChannelId}, whose charset test is what makes that
+     * refusal happen.
      */
     private static String normaliseChannel(CommandContext<FabricClientCommandSource> ctx, String channel) {
         String value = channel.trim().toLowerCase(Locale.ROOT);
         if (!ExposurePolicy.isWellFormedChannelId(value)) {
             feedback(ctx, Component.literal(
-                            "\"" + channel + "\" is not a channel id. Channels look like "
-                                    + "namespace:path, e.g. somemod:handshake -- run /cmdguard exposure "
-                                    + "or /cmdguard audit to see real ones. "
-                                    + "For a whole namespace, use /cmdguard withhold <namespace>.")
+                            "\"" + channel + "\" is not a channel id, so nothing was stored. "
+                                    + "Channels look like namespace:path, e.g. somemod:handshake -- "
+                                    + "one colon, no spaces, and only a-z 0-9 _ - . in the namespace "
+                                    + "(the path may also contain /). Run /cmdguard exposure or "
+                                    + "/cmdguard audit to see real ones. For a whole namespace, use "
+                                    + "/cmdguard withhold <namespace>.")
                     .withStyle(ChatFormatting.RED));
             return null;
         }

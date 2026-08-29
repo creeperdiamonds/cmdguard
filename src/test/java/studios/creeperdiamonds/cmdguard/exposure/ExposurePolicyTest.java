@@ -62,4 +62,56 @@ class ExposurePolicyTest {
     void matchingIsCaseInsensitive() {
         assertTrue(defaults().isExposed("MINECRAFT:Register"));
     }
+
+    @Test
+    void acceptsIdsThatCouldActuallyMatch() {
+        assertTrue(ExposurePolicy.isWellFormedChannelId("somemod:handshake"));
+        assertTrue(ExposurePolicy.isWellFormedChannelId("fabric:registry/sync"));
+        assertTrue(ExposurePolicy.isWellFormedChannelId("some-mod_2.0:a/b.c-d_e"));
+    }
+
+    @Test
+    void rejectsMalformedShapes() {
+        assertFalse(ExposurePolicy.isWellFormedChannelId(null));
+        assertFalse(ExposurePolicy.isWellFormedChannelId(""));
+        assertFalse(ExposurePolicy.isWellFormedChannelId("somemod"), "no colon");
+        assertFalse(ExposurePolicy.isWellFormedChannelId(":handshake"), "empty namespace");
+        assertFalse(ExposurePolicy.isWellFormedChannelId("somemod:"), "empty path");
+        assertFalse(ExposurePolicy.isWellFormedChannelId("a:b:c"), "two colons");
+    }
+
+    /**
+     * The regression this test exists for. {@code /cmdguard withhold channel} takes a
+     * {@code greedyString}, so the whole rest of the line arrives as one argument -- spaces
+     * included. The shape-only check accepted every id below (one colon, both halves
+     * non-empty), the command stored it and told the user it had been applied, and {@link
+     * ExposurePolicy#isExposed} could never match it, because a real channel id is the
+     * {@code toString()} of an {@code Identifier} and an {@code Identifier} accepts none of
+     * these characters. A stored id that silently withholds nothing is a false assurance in
+     * the privacy-critical direction, which is the one direction this feature must not fail
+     * in.
+     */
+    @Test
+    void rejectsIdentifierCharsetViolations() {
+        assertFalse(ExposurePolicy.isWellFormedChannelId("my mod:hand shake"),
+                "spaces in both halves -- the reported case");
+        assertFalse(ExposurePolicy.isWellFormedChannelId("somemod:hand shake"), "space in path");
+        assertFalse(ExposurePolicy.isWellFormedChannelId("some mod:handshake"), "space in namespace");
+        assertFalse(ExposurePolicy.isWellFormedChannelId("somemod:hand#shake"), "'#' is not allowed");
+        assertFalse(ExposurePolicy.isWellFormedChannelId("some/mod:handshake"),
+                "'/' is allowed in a path but not in a namespace");
+    }
+
+    /**
+     * Whatever {@link ExposurePolicy#isWellFormedChannelId} accepts must be an id the
+     * matching path can actually see, so the two are pinned to each other rather than
+     * merely both being asserted about.
+     */
+    @Test
+    void anAcceptedIdCanActuallyBeMatched() {
+        String id = "some-mod_2.0:a/b.c-d_e";
+        assertTrue(ExposurePolicy.isWellFormedChannelId(id));
+        assertFalse(new ExposurePolicy(Set.of(), Set.of(), Set.of(id)).isExposed(id),
+                "an id the command accepts must be one a withhold entry can match");
+    }
 }
