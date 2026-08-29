@@ -39,11 +39,16 @@ public final class ExposureGuard {
 
     /**
      * One-shot flag set by a mixin on {@code ClientCommonPacketListenerImpl#handleTransfer}
-     * and consumed by the very next {@link #beginConnection}. See that method's Javadoc for
-     * why a server transfer needs this and why leaving it dangling on a cancelled or failed
-     * transfer is acceptable -- unlike a dangling server key (the design this replaced), a
-     * dangling strictness flag can only ever cost the player a per-server grant, never leak
-     * one, so there is no failure mode here that needs a second cleanup mixin.
+     * and consumed by the {@link #beginConnection} call whose install actually succeeds --
+     * not by whichever call happens to run next. See that method's Javadoc and {@link
+     * #markNextConnectionAsTransfer}'s for why a server transfer needs this, why leaving it
+     * dangling on a cancelled or failed transfer is acceptable, and why "consumed by the
+     * next call" (an earlier version of this comment, and this flag's earlier behaviour)
+     * was wrong: a stray listener construction on the *origin* connection between the flag
+     * being set and the destination connection being constructed -- reachable under
+     * server-chosen packet ordering, e.g. a reconfigure batched just ahead of the transfer --
+     * would otherwise consume the flag on a call that never installs anything, silently
+     * discarding it before the destination connection ever gets a chance to read it.
      */
     private static final AtomicBoolean NEXT_CONNECTION_IS_TRANSFER = new AtomicBoolean(false);
 
@@ -130,6 +135,25 @@ public final class ExposureGuard {
      * which is the dangerous direction. That asymmetry -- cost the player a grant vs. leak
      * one -- is the entire justification for tolerating cross-call state here and nowhere
      * else in this class. Do not "clean this up" into carrying a key across calls again.
+     *
+     * <p><b>That asymmetry justifies dangling, but not mis-consumption, and an earlier
+     * version of this fix conflated the two.</b> {@link #beginConnection} used to consume
+     * this flag unconditionally on every call via {@code getAndSet(false)}, on the
+     * reasoning that only the first call for a given connection can ever install a
+     * snapshot. That reasoning covers the same connection consuming its own flag twice; it
+     * does not cover a *different* connection's call consuming a flag meant for this one.
+     * Concretely: {@code handleTransfer} sets this flag, then calls {@code
+     * ConnectScreen.startConnecting} on the *origin* connection, which is still alive at
+     * that point. If the server batches a reconfigure (or anything else that triggers
+     * another {@code ClientCommonPacketListenerImpl} construction) on that origin
+     * connection before the destination connection is constructed, that construction's
+     * {@code beginConnection} call would consume (and discard) this flag even though its
+     * own install is rejected by {@link ConnectionInit#cmdguard$initExposure} (the origin
+     * connection already has a snapshot) -- burning the flag on a no-op and leaving the
+     * destination connection to key itself to the origin server's grants after all,
+     * exactly the leak this flag exists to prevent. {@link #beginConnection} now consumes
+     * this flag only inside the branch where its own install actually succeeds, which the
+     * origin connection's spurious call never reaches.
      */
     public static void markNextConnectionAsTransfer() {
         NEXT_CONNECTION_IS_TRANSFER.set(true);
@@ -145,18 +169,29 @@ public final class ExposureGuard {
      * to call from wherever the caller's constructor happens to run, client thread or netty
      * event loop.
      *
-     * <p>Idempotent per connection: only the call that actually installs a snapshot (see
-     * {@link ConnectionInit#cmdguard$initExposure}) resets the ledger. A second or third
-     * call for the same connection does nothing -- deliberately not resetting the ledger
-     * again, since the ledger is what surfaces everything recorded during the configuration
-     * phase (see {@link ChannelLedger}'s "outlives a disconnect" Javadoc), and wiping it on
-     * the play-phase construction would erase exactly the traffic this feature exists to
+     * <p>Idempotent per connection, and this is now a hard guarantee rather than an
+     * ordering assumption: {@link ConnectionInit#cmdguard$initExposure} installs via a
+     * genuine compare-and-set on a field written only by that method (see {@code
+     * ConnectionMixin}'s {@code cmdguard$snapshot} field Javadoc), so across any number of
+     * calls and any thread interleaving, exactly one call for a given {@code Connection}
+     * ever has its install succeed. Only that call resets the ledger. A call whose install
+     * is rejected does nothing else -- deliberately not resetting the ledger again, since
+     * the ledger is what surfaces everything recorded during the configuration phase (see
+     * {@link ChannelLedger}'s "outlives a disconnect" Javadoc), and wiping it on the
+     * play-phase construction would erase exactly the traffic this feature exists to
      * surface.
      *
-     * <p>Consumes {@link #NEXT_CONNECTION_IS_TRANSFER} exactly once per call (not per
-     * connection) via {@link AtomicBoolean#getAndSet} -- harmless, because only the first
-     * call for a given connection can ever actually install a snapshot; a later call for
-     * the same connection reads the flag as already consumed and is a no-op regardless.
+     * <p>Reads {@link #NEXT_CONNECTION_IS_TRANSFER} first (a peek, not a consume) to decide
+     * which snapshot to attempt installing, then consumes it via {@link
+     * AtomicBoolean#compareAndSet(boolean, boolean) compareAndSet(true, false)} <em>only
+     * inside the branch where this call's own install succeeds</em>. This is deliberate,
+     * and different from an earlier version of this method that consumed the flag
+     * unconditionally on every call: see {@link #markNextConnectionAsTransfer}'s Javadoc
+     * for the concrete scenario (a stray construction on the origin connection of a
+     * transfer) that made unconditional consumption a real leak. Gating consumption on this
+     * call's own success means a call whose install is rejected -- which is exactly the
+     * failure mode in that scenario -- never touches the flag, leaving it for the call that
+     * actually needs it.
      *
      * <p>Safe to never call: if this is skipped, or a packet is sent before it runs, {@code
      * ConnectionMixin} falls back to {@link #globalsOnlySnapshot()} lazily on first use,
@@ -173,10 +208,13 @@ public final class ExposureGuard {
         if (!(connection instanceof ConnectionInit init)) {
             return;
         }
-        boolean isTransfer = NEXT_CONNECTION_IS_TRANSFER.getAndSet(false);
+        boolean isTransfer = NEXT_CONNECTION_IS_TRANSFER.get();
         Snapshot snapshot = isTransfer ? globalsOnlySnapshot() : snapshotFor(serverKey);
         if (init.cmdguard$initExposure(snapshot)) {
             LEDGER.reset();
+            if (isTransfer) {
+                NEXT_CONNECTION_IS_TRANSFER.compareAndSet(true, false);
+            }
         }
     }
 

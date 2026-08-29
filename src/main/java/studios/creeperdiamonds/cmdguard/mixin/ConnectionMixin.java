@@ -13,6 +13,8 @@ import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
 
+import java.util.concurrent.atomic.AtomicReference;
+
 /**
  * The outbound choke point.
  *
@@ -52,12 +54,41 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
     public abstract PacketFlow getSending();
 
     /**
-     * The whole outbound decision surface for this connection. {@code volatile} so a
-     * {@link #cmdguard$initExposure} write on the client thread is visible to a
-     * {@code sendPacket} call already running on the netty event loop, and vice versa.
+     * The real, per-server decision surface for this connection, once installed. Written
+     * ONLY by {@link #cmdguard$initExposure} via {@link AtomicReference#compareAndSet}, and
+     * only ever transitions {@code null -> non-null}, exactly once, for the lifetime of this
+     * {@code Connection} instance. Nothing else may write to this field -- in particular,
+     * {@link #cmdguard$snapshot()} below must never write here, only read.
+     *
+     * <p>This split (this field vs. {@link #cmdguard$fallback}) exists because of a defect
+     * the previous, single-field version had: the first outbound packet on every connection
+     * is the handshake, sent through {@code sendPacket} directly from {@code
+     * initiateServerboundConnection}'s {@code runOnceConnected} lambda -- before {@code
+     * ClientHandshakePacketListenerImpl} exists, which does not extend {@code
+     * ClientCommonPacketListenerImpl} and so triggers no {@code beginConnection} call at
+     * all. That packet's read of {@code cmdguard$snapshot()} used to lazily install the
+     * globals-only fallback into this very field; by the time the real
+     * {@code cmdguard$initExposure} call happened (several packets later, from {@code
+     * ClientCommonPacketListenerImpl}'s constructor), the field was already non-null, so the
+     * idempotence guard rejected the real install outright -- on every connection,
+     * singleplayer and multiplayer alike. Splitting the fields makes that structurally
+     * impossible: a read can populate {@link #cmdguard$fallback} as many times as it likes
+     * and can never touch this field.
      */
     @Unique
-    private volatile ExposureGuard.Snapshot cmdguard$snapshot;
+    private final AtomicReference<ExposureGuard.Snapshot> cmdguard$snapshot = new AtomicReference<>();
+
+    /**
+     * The globals-only snapshot returned by {@link #cmdguard$snapshot()} for the window
+     * before {@link #cmdguard$initExposure} has installed the real one -- lazily computed
+     * and cached here, entirely separate from {@link #cmdguard$snapshot}. {@code volatile}
+     * for the same cross-thread visibility reason as that field; a benign race where two
+     * threads both compute and cache their own fallback before either wins is tolerated,
+     * since both read the same (for the duration of the race, unchanging) global config and
+     * neither is ever more permissive than the other -- see {@link #cmdguard$snapshot()}.
+     */
+    @Unique
+    private volatile ExposureGuard.Snapshot cmdguard$fallback;
 
     /**
      * Called by the connection lifecycle as soon as the server key for this connection is
@@ -65,12 +96,18 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
      * #cmdguard$snapshot()} below falls back to a globals-only snapshot on first use if this
      * was skipped or lost the race with the first packet.
      *
-     * <p>Idempotent: installs {@code snapshot} only if none is installed yet, and reports
-     * back via the return value whether it did. This matters because {@code
-     * ClientCommonPacketListenerImpl}'s shared constructor runs more than once against this
-     * same {@code Connection} instance -- once for the configuration-phase listener, again
-     * for the play-phase listener, and a third time on a mid-game reconfigure -- and only
-     * the first of those calls may decide this connection's snapshot. See {@code
+     * <p>Idempotent, and now a genuine compare-and-set rather than a volatile
+     * check-then-act: {@link #cmdguard$snapshot} starts {@code null} and this method installs
+     * {@code snapshot} only via {@link AtomicReference#compareAndSet(Object, Object)
+     * compareAndSet(null, snapshot)}, so exactly one caller among any number of concurrently
+     * racing callers ever succeeds, for the entire lifetime of this connection -- this is not
+     * merely "usually true because construction is sequential"; it holds regardless of
+     * ordering or thread. This matters because {@code ClientCommonPacketListenerImpl}'s
+     * shared constructor runs more than once against this same {@code Connection} instance
+     * -- once for the configuration-phase listener, again for the play-phase listener, and a
+     * third time on a mid-game reconfigure -- and {@code beginConnection} is reachable from
+     * the netty event loop, so nothing guarantees those calls are ordered in practice. Only
+     * the winning call may decide this connection's snapshot. See {@code
      * ExposureGuard.beginConnection}'s Javadoc for why a second, silently-accepted call here
      * used to be a real leak (it would replace a real per-server snapshot with a
      * {@code "singleplayer"} fallback for the rest of the connection's life).
@@ -78,31 +115,30 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
     @Unique
     @Override
     public boolean cmdguard$initExposure(ExposureGuard.Snapshot snapshot) {
-        if (cmdguard$snapshot != null) {
-            return false;
-        }
-        cmdguard$snapshot = snapshot;
-        return true;
+        return cmdguard$snapshot.compareAndSet(null, snapshot);
     }
 
     /**
-     * Returns this connection's snapshot, computing a globals-only fallback on first use
-     * if {@link #cmdguard$initExposure} never ran. Two threads racing here before init can
-     * each compute and publish their own fallback snapshot -- harmless, since both read the
-     * same (unchanging, for the duration of this race) global config and neither can ever
-     * be more permissive than the other; the field simply ends up holding whichever one
-     * wrote last. What cannot happen is a *different connection's* snapshot ending up here,
-     * because this field belongs to this Connection instance alone.
+     * Returns this connection's snapshot: the real one from {@link #cmdguard$snapshot} if
+     * {@link #cmdguard$initExposure} has installed it, otherwise a globals-only fallback
+     * computed (and cached, for later calls) into the entirely separate {@link
+     * #cmdguard$fallback} field. This method only ever reads {@link #cmdguard$snapshot}, via
+     * {@link AtomicReference#get()} -- it must never write to it, since that cell exists
+     * solely to record whether the real, one-time install has happened.
      */
     @Unique
     @Override
     public ExposureGuard.Snapshot cmdguard$snapshot() {
-        ExposureGuard.Snapshot snapshot = cmdguard$snapshot;
-        if (snapshot == null) {
-            snapshot = ExposureGuard.globalsOnlySnapshot();
-            cmdguard$snapshot = snapshot;
+        ExposureGuard.Snapshot installed = cmdguard$snapshot.get();
+        if (installed != null) {
+            return installed;
         }
-        return snapshot;
+        ExposureGuard.Snapshot fallback = cmdguard$fallback;
+        if (fallback == null) {
+            fallback = ExposureGuard.globalsOnlySnapshot();
+            cmdguard$fallback = fallback;
+        }
+        return fallback;
     }
 
     @Inject(method = "sendPacket(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
