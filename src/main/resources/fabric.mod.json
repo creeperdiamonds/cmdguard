@@ -3,7 +3,7 @@
   "id": "cmdguard",
   "version": "${version}",
   "name": "CmdGuard",
-  "description": "Client-side outbound command guard. Commands your client handles locally stay local; anything else is blocked unless you allowlist it. Also reports which of your installed mods can receive messages from a server.",
+  "description": "Client-side outbound command guard. Commands your client handles locally stay local; anything else is blocked unless you allowlist it. Also withholds client metadata -- channels and mod identifiers outside a small default set -- that a server has not been whitelisted to see, and reports which of your installed mods can receive messages from a server.",
   "authors": ["Creeperdiamonds Studios"],
   "contact": {
     "sources": "https://github.com/creeperdiamonds/cmdguard",

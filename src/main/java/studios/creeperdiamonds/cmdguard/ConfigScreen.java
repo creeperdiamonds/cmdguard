@@ -5,8 +5,10 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.network.chat.Component;
 
 /**
- * Minimal settings screen reached from Mod Menu. The allowlist itself is edited via
- * /cmdguard allow|deny, so this only surfaces the two toggles plus a channel audit.
+ * Minimal settings screen reached from Mod Menu. The command allowlist is edited via
+ * /cmdguard allow|deny and the exposure whitelist's namespaces via /cmdguard
+ * expose|withhold, so this only surfaces the four toggles (guard, clicked-command
+ * policy, exposure whitelist, inbound-probe filtering) plus a channel audit button.
  */
 public final class ConfigScreen extends Screen {
     private final Screen parent;

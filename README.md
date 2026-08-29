@@ -41,7 +41,7 @@ advertises a channel or identifier the client does not actually have. See
 | `/cmdguard audit` | List mods reachable over server channels |
 | `/cmdguard clear` | Empty the allowlist (strict mode) |
 | `/cmdguard exposure` | List channels observed this connection and their EXPOSED/WITHHELD state |
-| `/cmdguard expose <namespace>` | Allow a namespace for the current server; add `global` before the namespace to allow it everywhere |
+| `/cmdguard expose <namespace>` | Allow a namespace for the current connection (server or singleplayer world); add `global` before the namespace to allow it everywhere |
 | `/cmdguard withhold <namespace>` | Withhold a previously-exposed namespace |
 
 Config lives at `config/cmdguard.json`. A settings screen is available via Mod Menu,
@@ -95,20 +95,34 @@ answer, and it can't send you data over a channel you never advertised. A server
 lifetime of an open connection, so `/cmdguard expose` takes effect on your *next*
 connection, not the one you're on.
 
-**Grants are per server address**, keyed on the address you connected to, plus
-`/cmdguard expose global <namespace>` to allow a namespace everywhere instead of just
-the current server. A few cases don't get a per-server grant:
+**Grants are per connection address**, keyed on the address the connection actually
+carries, plus `/cmdguard expose global <namespace>` to allow a namespace everywhere
+instead of just that one connection. This covers more than ordinary multiplayer:
 
-- **Singleplayer** has no server address, so only global grants apply there. That's
-  definitional, not a limitation — there is no per-server identity to key a grant to.
-- **A server transfer** (the vanilla feature that hands you from one server to another
-  mid-session) deliberately falls back to global grants only, rather than carrying the
-  origin server's per-server grants over to the destination. This is stricter than it
-  has to be, on purpose: the destination is a different server and gets no grant it
-  wasn't given directly.
-- **Realms and quick-play joins are fully covered** — both carry a real server identity
-  through to the connection, so per-server grants apply to them exactly as they do to a
-  normal multiplayer join. They are not exceptions.
+- **Singleplayer gets its own grants too.** A singleplayer connection has no real
+  server address, so it is keyed on the literal string `"singleplayer"` instead. This
+  is not a limitation: `/cmdguard expose <namespace>` works normally while playing a
+  world you host (with or without "Open to LAN"), and the grant is stored under that
+  reserved key, kept separate from any real server's grants.
+- **Realms, quick-play, and joining a LAN game from the "LAN Games" list are all fully
+  covered.** Each of these carries a real, correctly-addressed server identity into the
+  connection — a Realms join, a quick-play join, and a LAN join all end up passing a
+  genuine `ServerData` through to the same code path an ordinary "Direct Connect" join
+  uses, keyed on that real address exactly like any other server. A LAN join is keyed
+  on the LAN host's actual discovered address, not a special shared word — so if that
+  address changes between sessions (a common case for a dynamically-assigned local IP),
+  the grant from a previous session may not carry over, the same as it wouldn't for any
+  server whose address changed.
+- **The one case that deliberately does not get a per-connection grant is a server
+  transfer** (the vanilla feature that hands you from one server to another
+  mid-session): it falls back to global grants only, rather than carrying the origin
+  server's grants over to the destination. Stricter than it has to be, on purpose — the
+  destination is a different server and gets no grant it wasn't given directly.
+- There is also a brief window, before a new connection has finished the handshake, where
+  no per-connection key has been established yet. `/cmdguard expose <namespace>` (without
+  `global`) refuses during that window and during a transfer-flagged connection, telling
+  you to use `/cmdguard expose global <namespace>` instead — that message is how you'd
+  notice either case in practice.
 
 ## Building
 

@@ -15,12 +15,15 @@ import java.util.TreeMap;
 import java.util.Map;
 
 /**
- * The readout of the exposure layer.
+ * Enumerates which installed mods have registered to receive a networking channel --
+ * i.e. which of your mods a server could ask something of -- and cross-references that
+ * against the channels the connected server has declared it accepts. {@code /cmdguard
+ * audit} is this class's report.
  *
- * <p>A server cannot read your mods folder and Fabric Loader never sends a mod list. What
- * a server CAN do is ask on a custom channel, or simply read the channel list your client
- * advertises -- and either names your mods. This lists the channels involved and what
- * CmdGuard decided about each.
+ * <p>This class does not decide what is exposed or withheld, and prints no verdict.
+ * That decision, and its per-channel readout, belongs to the exposure whitelist ({@code
+ * ExposurePolicy}, backed by {@code ChannelLedger}) and is shown by {@code /cmdguard
+ * exposure}, not here.
  *
  * <p>CmdGuard withholds what is not on the exposure whitelist and never fabricates. It
  * does not claim to be vanilla, does not alter minecraft:brand, and never advertises a
