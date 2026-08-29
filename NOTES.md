@@ -14,6 +14,64 @@ API branch `1.21.11`. This project uses **official Mojang mappings**.
 | 5 | a generic root literal | shadows the server command AND falls through when this mod isn't loaded | root is the mod id `cmdguard` |
 | 6 | registering a custom networking channel | announced via `minecraft:register` | this mod registers none |
 
+## Known hazards
+
+### The login phase is not covered
+
+Verified 2026-08-29 against the same decompiled 1.21.11 sources and the Fabric API 0.141.6
+sources pinned in `gradle.properties`.
+
+The exposure layer covers the configuration and play phases and nothing else. Two
+independent reasons, both structural:
+
+- `net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl` is declared
+  `implements ClientLoginPacketListener` — it extends **none** of this mod's mixin targets,
+  so no listener-level hook reaches it.
+- The login phase's packets are a different pair. `ServerboundCustomQueryAnswerPacket` is
+  `record ServerboundCustomQueryAnswerPacket(int transactionId, @Nullable
+  CustomQueryAnswerPayload payload) implements Packet<ServerLoginPacketListener>` — **not**
+  a `ServerboundCustomPayloadPacket`, so `ExposureGuard.shouldDrop`'s `instanceof` skips it
+  even though the `Connection#sendPacket` hook does see it go past. Inbound,
+  `ClientboundCustomQueryPacket` is likewise not a `ClientboundCustomPayloadPacket`, so the
+  `channelRead0` hook skips it too.
+
+Why that is a disclosure and not just a gap. Vanilla always answers a login query with
+`null`:
+
+```java
+// ClientHandshakePacketListenerImpl
+public void handleCustomQuery(ClientboundCustomQueryPacket clientboundCustomQueryPacket) {
+    this.updateStatus.accept(Component.translatable("connect.negotiating"));
+    this.connection.send(new ServerboundCustomQueryAnswerPacket(clientboundCustomQueryPacket.transactionId(), null));
+}
+```
+
+Fabric API's `ClientHandshakePacketListenerImplMixin` cancels that and lets
+`ClientLoginNetworkAddon.handlePacket` answer instead whenever a mod registered a handler
+for the queried channel; with no handler it returns false and the vanilla `null` stands.
+So **answering at all — not the contents of the answer — is the disclosure**, and a server
+can probe for a specific mod by sending one login query.
+
+Deliberately not fixed here. Withholding a login answer means choosing what to put in its
+place, and this mod does not fabricate; picking between "stay silent and stall the login",
+"send the vanilla `null` a mod would not have sent", and "answer" is a design decision, not
+a bug fix. Written down rather than papered over. Also stated in the README under "What is
+not covered".
+
+### `"required": true` does **not** make the build catch a wrong mixin target
+
+Checked directly, 2026-08-29, by pointing an `@Inject` at `channelReadZZZ` — a method that
+does not exist on `Connection` — and running `./gradlew compileJava`: **BUILD SUCCESSFUL**.
+The mixin annotation processor validates the mixin's *target class* and the shape of the
+handler method, not that the named target method resolves.
+
+`"required": true` with `defaultRequire: 1` still does its job — it makes a failed
+injection a hard crash at **launch** instead of a silently disabled guard — but that is a
+runtime check, not a build-time one. The design doc's "a mapping change breaks the build
+rather than shipping a jar whose guard silently does nothing" overstates it: it breaks the
+*game launch*. A green build is evidence of compilation and nothing more; every descriptor
+in this file was verified with `javap` against the mapped jar for exactly this reason.
+
 ## Facts worth not re-litigating
 
 - `ClientCommandInternals.executeCommand` returns `true` (command NOT sent) whenever the

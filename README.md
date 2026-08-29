@@ -41,12 +41,23 @@ advertises a channel or identifier the client does not actually have. See
 | `/cmdguard audit` | List mods reachable over server channels |
 | `/cmdguard clear` | Empty the allowlist (strict mode) |
 | `/cmdguard exposure` | List channels observed this connection and their EXPOSED/WITHHELD state |
-| `/cmdguard expose <namespace>` | Allow a namespace for the current connection (server or singleplayer world); add `global` before the namespace to allow it everywhere |
-| `/cmdguard withhold <namespace>` | Withhold a previously-exposed namespace |
+| `/cmdguard expose <namespace>` | Allow a namespace on the server you are connected to; add `global` before the namespace to allow it everywhere |
+| `/cmdguard withhold <namespace>` | Withhold a previously-exposed namespace, in every scope it was granted in (the output names which) |
+| `/cmdguard expose channel <id>` | Allow one channel, e.g. `somemod:handshake`, everywhere — for when a namespace grant is too coarse |
+| `/cmdguard withhold channel <id>` | Withhold one channel everywhere, even where its namespace is exposed |
 
 Config lives at `config/cmdguard.json`. A settings screen is available via Mod Menu,
 with toggles for the guard, clicked-command policy, the exposure whitelist, and
 whether inbound probes on withheld channels are blocked.
+
+Note that `/cmdguard off` switches the exposure whitelist off along with the command
+guard — it is the master switch for both. The config screen, `/cmdguard status` and
+`/cmdguard exposure` all say so rather than reporting the whitelist as on.
+
+**If you get kicked**, the readout is still there: CmdGuard logs one line per channel the
+first time it withholds on it, and logs the connection's `exposed=N withheld=M` tally when
+you next connect, so `logs/latest.log` has the record even though a kick leaves no chat to
+read and `/cmdguard exposure` needs a live connection.
 
 ## What this does and doesn't do
 
@@ -76,7 +87,9 @@ See [NOTES.md](NOTES.md) for the developer-facing hazard table.
 
 By default, CmdGuard withholds every channel outside the `fabric`, `minecraft`, and `c`
 namespaces, in both directions — outbound (what your client advertises or sends) and
-inbound (what a server sends you on that channel). This includes the identifier lists
+inbound (what a server sends you on that channel) — throughout the configuration and play
+phases of a connection. **The login phase is not covered**; see
+[What is not covered](#what-is-not-covered) below. This includes the identifier lists
 carried inside three of Fabric API's own payloads: the accepted-attachments,
 recipe-serializer, and custom-ingredient sync messages, each of which otherwise names
 every third-party mod that registered one. Everything outside those three namespaces is
@@ -124,17 +137,46 @@ instead of just that one connection. This covers more than ordinary multiplayer:
   mid-session): it falls back to global grants only, rather than carrying the origin
   server's grants over to the destination. Stricter than it has to be, on purpose — the
   destination is a different server and gets no grant it wasn't given directly.
-- There is also a brief window, before a new connection has finished the handshake, where
-  no per-connection key has been established yet. `/cmdguard expose <namespace>` (without
-  `global`) refuses during that window and during a transfer-flagged connection, telling
-  you to use `/cmdguard expose global <namespace>` instead — that message is how you'd
-  notice either case in practice.
+  A transferred connection is therefore the only case where `/cmdguard expose <namespace>`
+  (without `global`) refuses, telling you to use `/cmdguard expose global <namespace>`
+  instead — that message is how you'd notice it in practice. (There is also a brief window
+  early in a connection, before the per-connection key is established, that runs on global
+  grants only; you cannot type a command during it, so you will never meet it.)
+
+## What is not covered
+
+**The login phase.** Everything above applies to the configuration and play phases of a
+connection. It does not apply to the login phase, which runs before either and uses a
+different pair of packets — `ClientboundCustomQueryPacket` and
+`ServerboundCustomQueryAnswerPacket`, neither of which is the custom-payload packet
+CmdGuard filters — handled by a listener that shares no base class with the ones CmdGuard
+hooks.
+
+That matters because of how Fabric API answers a login query: a vanilla client always
+replies `null`, while a client with a mod that registered a login-query handler for that
+channel replies with a payload. **Answering at all, rather than what the answer says, is
+already the disclosure** — so a server that sends a login query on a mod's channel can
+learn whether you have that mod, and CmdGuard does not currently stop it.
+
+This is a design change rather than a fix — withholding a login answer means deciding what
+to send in its place, and CmdGuard does not fabricate — so it is written down here rather
+than papered over. See [NOTES.md](NOTES.md).
 
 ## Building
 
 CI builds every push (`.github/workflows/build.yml`) and uploads the jar as an artifact,
 so you never have to run Gradle locally. To build yourself: `./gradlew build`, jar lands
 in `build/libs/`. Requires JDK 21.
+
+**If CmdGuard refuses to start after a Fabric API update, that is deliberate.**
+`fabric.mod.json` pins an exact `fabric-api` version rather than a range, because this mod
+reads the internals of Fabric API's own client-to-server payloads — the accepted-attachments,
+recipe-serializer and custom-ingredient messages — to strip third-party identifiers out of
+them. Those are implementation details with no compatibility promise: a routine Fabric API
+update can change a payload's shape, and a CmdGuard that silently stopped filtering one
+would be worse than a CmdGuard that refuses to load. Failing to start is the fail-closed
+behaviour. The fix is a CmdGuard release that has been checked against the new Fabric API,
+not a looser pin.
 
 ## License
 
