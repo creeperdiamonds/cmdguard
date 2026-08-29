@@ -95,8 +95,11 @@ See [NOTES.md](NOTES.md) for the developer-facing hazard table.
 
 By default, CmdGuard withholds every channel outside the `fabric`, `minecraft`, and `c`
 namespaces, in both directions — outbound (what your client advertises or sends) and
-inbound (what a server sends you on that channel) — throughout all three phases of a
-connection: login, configuration and play. This includes the identifier lists
+inbound (what a server sends you on that channel) — throughout the configuration and play
+phases, and in the login phase by a different mechanism with the same outcome (see
+[The login phase](#the-login-phase): nothing is dropped there and nothing outbound can be
+filtered, because a login answer names no channel — instead the query reaches the client
+emptied, so vanilla answers it rather than a mod). This includes the identifier lists
 carried inside three of Fabric API's own payloads: the accepted-attachments,
 recipe-serializer, and custom-ingredient sync messages, each of which otherwise names
 every third-party mod that registered one. Everything outside those three namespaces is
@@ -188,6 +191,15 @@ not do that.
   left to write to and `/cmdguard exposure` needs a connection, so every withheld login
   answer is written to `latest.log` as a `WARN` naming the channel and the exact command
   to run. That line is the only place the cause appears.
+
+**Singleplayer is exempt here too.** The login phase runs before a connection has a server
+identity, so it cannot use the per-server rule that exempts local worlds everywhere else.
+It is exempted directly instead: a local world's connection is an in-process one, and
+CmdGuard leaves login queries on it alone. That matters because the integrated server can
+itself send login queries — a mod's own server-side handshake — and withholding an answer
+from your own process buys nothing while it can stop the world from loading. Hosting with
+"Open to LAN" is still the same in-process connection and is still exempt; *joining*
+someone else's LAN game is a real connection and is filtered like any other server.
 
 You can switch this off on its own — "Login queries" in the Mod Menu settings screen —
 without disabling the rest of the exposure whitelist. It is on by default.
