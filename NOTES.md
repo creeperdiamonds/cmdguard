@@ -270,10 +270,27 @@ public void configurePacketHandler(ChannelPipeline channelPipeline) {
 }
 ```
 
-Every decoded packet in every protocol phase — login, configuration, play — reaches
-`channelRead0`, and nothing reaches a `PacketListener` without passing through it first
-(`genericsFtw` is the only dispatch, and it is one line below the injection point). One
-`Connection` object survives the whole session, so one hook covers all phases.
+Every inbound **pipeline message**, in every protocol phase — login, configuration, play —
+reaches `channelRead0`, and no pipeline message reaches a `PacketListener` without passing
+through it first (`genericsFtw` is the only dispatch, and it is one line below the
+injection point). One `Connection` object survives the whole session, so one hook covers
+all phases.
+
+**"Pipeline message", not "packet" — the distinction is load-bearing, and an earlier
+version of this paragraph got it wrong.** It used to read "every decoded *packet* … and
+nothing reaches a `PacketListener` without passing through it first", which is false in the
+play phase and is exactly what hid the bundle gap below for a whole review cycle. In the
+play protocol one pipeline message can be a `ClientboundBundlePacket` carrying an arbitrary
+number of real packets, and those sub-packets are dispatched to the listener later, by
+`ClientPacketListener#handleBundlePacket`, *without* going through `channelRead0` again. So:
+
+- one hook at `channelRead0` sees every inbound message — that part is true and is why the
+  outbound/inbound choke-point argument stands;
+- a hook at `channelRead0` that only tests `instanceof SomePacketType` sees only the
+  outermost packet of each message, and must unwrap a bundle itself.
+
+See "Inbound: packet bundles" below for the verification and for what the filter does
+about it.
 
 **Why not the packet listener.** The filter used to inject at `HEAD` of
 `ClientCommonPacketListenerImpl#handleCustomPayload(ClientboundCustomPayloadPacket)`.
@@ -303,6 +320,133 @@ read the frozen per-connection snapshot and the payload's `Identifier`, and drop
 
 `Connection` is shared by client and server, so the flow must be checked:
 `getReceiving() == PacketFlow.CLIENTBOUND` is the client side.
+
+### Inbound: packet bundles — a real gap in the play phase, now closed
+
+Verified 2026-08-29 by the same two readings as the rest of this section. A reviewer raised
+this from knowledge of 1.21.x rather than from this jar; every step below was then checked
+against the decompiled 1.21.11 sources and `javap` output, because an unverified pipeline
+assumption is what put the gap there in the first place. **The claim is correct.** One
+detail of the reported mechanism was not: there is no `BundlerInfo.EMPTY` in 1.21.11.
+`ProtocolInfo#bundlerInfo()` is declared `@Nullable BundlerInfo bundlerInfo()` and the
+non-play protocols simply never set one. Same conclusion, different mechanism.
+
+**1. Only the play clientbound protocol bundles.** `ProtocolInfoBuilder` sets
+`bundlerInfo` in exactly one place, `withBundlePacket`, and a repo-wide grep of the
+decompiled sources finds exactly one caller of that method:
+
+```java
+// GameProtocols.java:128
+public static final SimpleUnboundProtocol<ClientGamePacketListener, RegistryFriendlyByteBuf> CLIENTBOUND_TEMPLATE = ProtocolInfoBuilder.clientboundProtocol(
+    ConnectionProtocol.PLAY,
+    protocolInfoBuilder -> protocolInfoBuilder.withBundlePacket(
+            GamePacketTypes.CLIENTBOUND_BUNDLE, ClientboundBundlePacket::new, new ClientboundBundleDelimiterPacket()
+        )
+```
+
+So configuration, login, status, handshake and the *serverbound* play protocol all have
+`bundlerInfo() == null`. They are unaffected, as reported.
+
+**2. The bundler sits between `decoder` and `packet_handler`.** From `Connection.java`:
+
+```java
+public <T extends PacketListener> void setupInboundProtocol(ProtocolInfo<T> protocolInfo, T packetListener) {
+    ...
+    BundlerInfo bundlerInfo = protocolInfo.bundlerInfo();
+    if (bundlerInfo != null) {
+        PacketBundlePacker packetBundlePacker = new PacketBundlePacker(bundlerInfo);
+        inboundConfigurationTask = inboundConfigurationTask.andThen(
+            channelHandlerContext -> channelHandlerContext.pipeline().addAfter("decoder", "bundler", packetBundlePacker)
+        );
+    }
+```
+
+`configurePacketHandler` adds this `Connection` itself with `.addLast("packet_handler", this)`,
+so `bundler` is strictly upstream of `packet_handler`.
+
+**3. `PacketBundlePacker` swallows everything between the delimiters.** Its `decode` adds
+nothing to the outbound list while a `Bundler` is active; `BundlerInfo.createForPacket`'s
+`Bundler.addPacket` accumulates into an `ArrayList` and only returns a packet — the
+assembled `ClientboundBundlePacket` — when it sees the second delimiter. The delimiter
+packets themselves never reach `channelRead0`. The only restrictions on what may be inside
+are `verifyNonTerminalPacket` and a 4096 cap.
+
+**4. A custom payload can be inside one.** `CommonPacketTypes.CLIENTBOUND_CUSTOM_PAYLOAD`
+is registered in that same play clientbound template (`GameProtocols.java:156`, via
+`ClientboundCustomPayloadPacket.GAMEPLAY_STREAM_CODEC`), and `Packet#isTerminal()` is
+`default boolean isTerminal() { return false; }` with no override on
+`ClientboundCustomPayloadPacket`, so `verifyNonTerminalPacket` lets it through. Type-wise
+it fits too: the bundle holds `Packet<? super ClientGamePacketListener>` and
+`ClientboundCustomPayloadPacket implements Packet<ClientCommonPacketListener>`, which
+`ClientGamePacketListener` extends. Nothing prevents a server from putting its probe in a
+bundle.
+
+**5. Sub-packets bypass `channelRead0` entirely.**
+
+```java
+// ClientPacketListener.java:2465
+public void handleBundlePacket(ClientboundBundlePacket clientboundBundlePacket) {
+    PacketUtils.ensureRunningOnSameThread(clientboundBundlePacket, this, this.minecraft.packetProcessor());
+
+    for (Packet<? super ClientGamePacketListener> packet : clientboundBundlePacket.subPackets()) {
+        packet.handle(this);
+    }
+}
+```
+
+`ClientboundCustomPayloadPacket#handle` is `clientCommonPacketListener.handleCustomPayload(this)`
+— i.e. straight into `ClientCommonPacketListenerImpl#handleCustomPayload` and therefore
+into Fabric API's addon dispatch, having never met the inbound filter. **Confirmed bypass.**
+
+**The fix**: `ConnectionMixin#cmdguard$filterBundledPayloads`, a `@ModifyVariable` on the
+same `channelRead0` descriptor, replacing the bundle with one rebuilt from a *subset* of
+its own sub-packets (`ExposureGuard#filterBundle`). Removal only; no sub-packet is ever
+added or altered; a sub-packet that is not a `ClientboundCustomPayloadPacket` is never
+dropped, because bundles are how vanilla batches entity spawn traffic. The whole bundle is
+never cancelled, for the same reason. Descriptors used:
+
+```
+net.minecraft.network.protocol.game.ClientboundBundlePacket
+    public class ClientboundBundlePacket extends BundlePacket<ClientGamePacketListener>
+
+    public ClientboundBundlePacket(Iterable<Packet<? super ClientGamePacketListener>>)
+        descriptor: (Ljava/lang/Iterable;)V
+    public void handle(ClientGamePacketListener)
+        descriptor: (Lnet/minecraft/network/protocol/game/ClientGamePacketListener;)V
+
+net.minecraft.network.protocol.BundlePacket                    // the accessor is inherited
+    public final Iterable<Packet<? super T>> subPackets()
+        descriptor: ()Ljava/lang/Iterable;
+    protected BundlePacket(Iterable<Packet<? super T>>)
+        descriptor: (Ljava/lang/Iterable;)V
+
+net.minecraft.network.protocol.game.ClientboundBundleDelimiterPacket
+    public ClientboundBundleDelimiterPacket()
+        descriptor: ()V
+
+net.minecraft.network.ProtocolInfo
+    @Nullable BundlerInfo bundlerInfo()                        // interface method
+```
+
+**An emptied bundle is emitted, not cancelled, and that is safe.** Read, not assumed: a
+grep of the decompiled sources finds exactly two callers of `subPackets()` —
+`handleBundlePacket` above, whose body is a bare for-each, and `BundlerInfo.unbundlePacket`,
+which is the *server's* outbound path and is unreachable here. An empty bundle therefore
+runs the loop zero times and is completely inert. Nothing asserts a non-empty bundle.
+Emitting it keeps the decision in one place and leaves `receivedPackets` honest.
+
+**Fabric API 0.141.6 does touch bundles, and it helps rather than conflicts.**
+`net.fabricmc.fabric.mixin.networking.BundlePacketMixin` is a `@ModifyVariable` on
+`BundlePacket.<init>`'s `Iterable` argument that flattens nested bundles into a fresh
+`ArrayList`. Consequences, both benign: `subPackets()` is always a re-iterable `ArrayList`,
+and the `ClientboundBundlePacket` this mod constructs goes through that same flattening
+(a no-op copy of an already-flat, already-filtered list). Fabric's `ConnectionMixin` still
+touches no inbound handler — re-checked here: `<init>`, `sendPacket`, `validateListener`,
+`channelInactive`, `handleDisconnection`, `setupInboundProtocol`, `setupOutboundProtocol`.
+
+**Not verified in game.** Nothing in this project has ever run in Minecraft. This is a
+build plus a reading of the decompiled sources and the mapped bytecode; and per the
+`"required": true` note above, a green build does not even prove the mixin targets resolve.
 
 ### Inbound: the client custom-payload handler (no longer hooked — kept for reference)
 

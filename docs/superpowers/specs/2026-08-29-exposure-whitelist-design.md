@@ -119,9 +119,27 @@ is configuration-phase.
 The `PacketFlow.SERVERBOUND` guard keeps the integrated server's own traffic in
 singleplayer out of the filter.
 
-Inbound is filtered on the same policy (`ClientPacketListener#handleCustomPayload`): a
-mod that never receives the probe cannot answer it. A probing server will send on your
+Inbound is filtered on the same policy, and at the same choke point:
+`Connection#channelRead0`, the terminal `"packet_handler"` in the netty pipeline. A mod
+that never receives the probe cannot answer it. A probing server will send on your
 channels whether or not you advertised them.
+
+An earlier draft of this spec named `ClientPacketListener#handleCustomPayload` here, and
+that is where the filter first lived. It was moved for two reasons, both recorded in full
+in `NOTES.md`:
+
+- **A race.** Fabric API's own `ClientCommonPacketListenerImplMixin` injects at `HEAD` of
+  the same method with the same descriptor and cancels for exactly the payloads this
+  filter exists to block. Neither mixin declares a priority, and `@Inject(order = …)` does
+  not sort across mods; if Fabric's callback ran first the filter was a silent no-op.
+  `channelRead0` runs strictly before any `PacketListener` sees a message, so there is
+  nothing left to race.
+- **Bundles.** In the play protocol a `ClientboundBundlePacket` is one pipeline message
+  carrying many packets, and `ClientPacketListener#handleBundlePacket` dispatches its
+  sub-packets to the listener directly, without a second trip through `channelRead0`. The
+  inbound hook therefore matches `ClientboundBundlePacket` as well and re-emits it with
+  withheld custom-payload sub-packets removed — removal only, never a dropped
+  non-payload sub-packet, and never a cancelled bundle.
 
 ### Outcomes per outbound custom payload
 
@@ -200,8 +218,15 @@ Global policy plus a `Map<serverAddress, Set<String>>` of additional exposures, 
 An earlier draft of this spec also reserved `lan`. That turned out to be wrong, and the
 implementation is right: a LAN join carries the real discovered LAN address through the
 listener cookie, so it is keyed like any other server and gets its own grants. Only a
-connection with no `ServerData` at all falls back to `singleplayer`. Per-world grants
-therefore work in singleplayer and stay separate from every real server's.
+connection with no `ServerData` at all falls back to `singleplayer`.
+
+The `singleplayer` key therefore stays distinct from every real server's, which is what
+this reservation is for. It does **not** mean per-world grants take effect: singleplayer
+is exempt from filtering entirely (`ExposureGuard.snapshotFor` sets `active` false for
+this key, because a local world's connection has no remote party to disclose anything to),
+so a grant stored under `singleplayer` is recorded and never applied. Keeping the key
+separate is still worth doing — it stops a local-world grant from ever being read as a
+real server's.
 
 Exposures are granted **by namespace**, matching the rule: `/cmdguard expose <namespace>`
 applies to the current server, `--global` applies everywhere. A mod typically registers
