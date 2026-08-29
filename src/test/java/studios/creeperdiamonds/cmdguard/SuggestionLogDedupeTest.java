@@ -3,6 +3,7 @@ package studios.creeperdiamonds.cmdguard;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -28,10 +29,13 @@ class SuggestionLogDedupeTest {
      * The scenario the guard exists for: a server hangs {@code ASK_SERVER} directly under the
      * root, so every keystroke produces a longer root. Under the old per-root dedupe this was
      * one INFO line per character, spelling the withheld command name out in {@code
-     * latest.log}. It must now be one line.
+     * latest.log}. It must now be bounded by a small constant, not by the length of the typed
+     * word -- at most two lines: the bare first character (not yet a plausible root on its
+     * own) and the first entry that reaches two characters, which is trusted to speak for the
+     * rest of the word.
      */
     @Test
-    void aRootThatGrowsWithEveryKeystrokeIsReportedOnce() {
+    void aRootThatGrowsWithEveryKeystrokeIsReportedAtMostTwice() {
         String typed = "somemod:debug";
         int reported = 0;
         for (int i = 1; i <= typed.length(); i++) {
@@ -39,8 +43,9 @@ class SuggestionLogDedupeTest {
                 reported++;
             }
         }
-        org.junit.jupiter.api.Assertions.assertEquals(1, reported,
-                "one line for the whole word, not one per character");
+        assertEquals(2, reported,
+                "one line for the bare first character, one for the word -- not one per"
+                        + " character, and not zero");
     }
 
     /** And the first line is still emitted -- a guard nobody can see is the silent-filter bug. */
@@ -78,19 +83,36 @@ class SuggestionLogDedupeTest {
     }
 
     /**
-     * The set keeps the shortest of each family, so growing along one command cannot grow the
-     * set. If a suppressed longer root were added anyway, "s" here would already be in it and
-     * the later unrelated check below would still hold -- but the set would grow by one entry
-     * per keystroke, which is the bound this rule exists to hold.
+     * The bug this pins: a one-character root must never silence a later, wholly unrelated
+     * root that merely happens to share that first letter. Under the old rule, recording
+     * {@code s} once suppressed every later root beginning with {@code s} -- {@code setblock},
+     * {@code spawn}, {@code somemod:debug} among them -- for the rest of the process, with no
+     * log line at all. Each of these must now be reported on its own.
+     */
+    @Test
+    void aOneCharacterRootDoesNotSilenceALaterUnrelatedRootSharingItsFirstLetter() {
+        assertTrue(OutboundGuard.recordSuggestionRoot("s"));
+        assertTrue(OutboundGuard.recordSuggestionRoot("setblock"),
+                "a distinct word starting with the same bare letter must still be reported");
+        assertTrue(OutboundGuard.recordSuggestionRoot("spawn"),
+                "so must a second, unrelated word sharing only that first letter");
+        assertTrue(OutboundGuard.recordSuggestionRoot("somemod:debug"),
+                "and a third -- the letter alone never becomes the family's representative");
+    }
+
+    /**
+     * The set keeps the shortest at-or-past-threshold entry of each family, so growing along
+     * one command cannot grow the set without bound. Seeded with a two-character root -- long
+     * enough to act as a family representative, unlike the single-character case above.
      */
     @Test
     void suppressedRootsAreNotAddedSoTheSetStaysBoundedByFamilies() {
-        assertTrue(OutboundGuard.recordSuggestionRoot("s"));
-        for (String longer : new String[]{"so", "som", "some", "somemod:debug"}) {
+        assertTrue(OutboundGuard.recordSuggestionRoot("so"));
+        for (String longer : new String[]{"som", "some", "somemod:debug"}) {
             assertFalse(OutboundGuard.recordSuggestionRoot(longer));
         }
         // Re-adding the family's shortest entry must still be suppressed by that same entry,
         // which is only true if none of the above replaced or removed it.
-        assertFalse(OutboundGuard.recordSuggestionRoot("s"));
+        assertFalse(OutboundGuard.recordSuggestionRoot("so"));
     }
 }

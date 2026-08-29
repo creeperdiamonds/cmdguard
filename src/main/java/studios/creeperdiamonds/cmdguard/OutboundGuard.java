@@ -22,9 +22,18 @@ import java.util.Set;
 public final class OutboundGuard {
 
     /**
-     * Roots whose withheld completion requests have already been reported, kept pairwise
-     * prefix-incomparable: a root is only added when no entry is a prefix of it and it is a
-     * prefix of no entry. See {@link #logFirstSuggestionBlock} for why that is the bound.
+     * A root shorter than this can still be recorded (so an exact repeat of it dedupes), but
+     * it can never suppress a <em>different</em> root, longer or shorter. See
+     * {@link #recordSuggestionRoot} for what this bounds and why two is the chosen width.
+     */
+    private static final int MIN_PLAUSIBLE_ROOT_LENGTH = 2;
+
+    /**
+     * Roots whose withheld completion requests have already been reported. Not pairwise
+     * prefix-incomparable any more: a single-character entry may sit alongside a longer entry
+     * that starts with it, because only an entry at least {@link #MIN_PLAUSIBLE_ROOT_LENGTH}
+     * long is trusted to speak for a whole family. See {@link #recordSuggestionRoot} for the
+     * exact rule and {@link #logFirstSuggestionBlock} for why that is the bound.
      *
      * <p>Guarded by its own monitor rather than being a concurrent set, because the check is
      * now check-then-act over the <em>whole</em> set -- {@link #shouldBlockSuggestion} is
@@ -99,8 +108,11 @@ public final class OutboundGuard {
 
     /**
      * One INFO line the first time completions are withheld for a root, where "a root" is
-     * taken up to prefixes: a root is reported only when no already-reported root is a prefix
-     * of it and it is a prefix of no already-reported root.
+     * taken up to prefixes: a root is reported only when no already-reported root <em>at
+     * least {@link #MIN_PLAUSIBLE_ROOT_LENGTH} characters long</em> is a prefix of it and it
+     * is a prefix of no such already-reported root. A root shorter than that never suppresses
+     * anything but an exact repeat of itself. See {@link #recordSuggestionRoot} for the exact
+     * rule.
      *
      * <p><b>Why prefixes, and not simply once per distinct root.</b> The plain per-root dedupe
      * this replaced was justified on the grounds that "a request goes out per keystroke and
@@ -115,6 +127,29 @@ public final class OutboundGuard {
      * argument was ever logged, but the stated bound was not the real bound, and a guard
      * writing the very keystrokes it withheld into a file is not a detail to leave standing.
      *
+     * <p><b>The real suppression width, stated plainly, because the first version of this
+     * rule understated its own cost.</b> A single character (the first key of the harvest
+     * case above) is not enough evidence that a family exists: {@code s} is a prefix of
+     * essentially every root beginning with that letter, so letting it suppress meant every
+     * later, wholly unrelated command sharing only that first letter -- {@code setblock},
+     * {@code spawn}, {@code somemod:debug} were the very examples this guard exists for --
+     * was withheld with no log line at all, for the rest of the process, across reconnects
+     * and across servers. "Tab does nothing, and the log says nothing" is exactly the
+     * silent-filter condition this INFO line exists to prevent. The fix: an entry only gets to
+     * suppress a <em>different</em> root, longer or shorter, once it is itself at least {@link
+     * #MIN_PLAUSIBLE_ROOT_LENGTH} characters. A root shorter than that is still recorded (so
+     * an exact repeat of it, e.g. a standalone one-letter command retyped, is still deduped)
+     * but is never trusted to speak for anything beyond itself -- every longer root that
+     * merely happens to share its first character is now reported in its own right, the moment
+     * it reaches the threshold. Two was chosen, not one, because it is the smallest length at
+     * which a shared prefix has stopped meaning "the same first keystroke of any command in
+     * the alphabet" and started meaning "these two requests probably continue the same typed
+     * word" -- the same order of coincidence this rule already accepts for {@code ban}/{@code
+     * banip} below, not the whole-alphabet collision a bare first character produces. The
+     * character-by-character example above still produces at most two lines under this rule
+     * -- one for the bare {@code s} the first time any family reaches it, and one for {@code
+     * so}, the first entry at or past the threshold -- not fourteen, and not zero.
+     *
      * <p>Prefix dedupe was chosen over the other candidate -- keep the first line at INFO and
      * drop later ones to DEBUG -- because it bounds the log <em>structurally</em>, at every
      * log level. DEBUG lines are merely hidden by the default log4j configuration; a user
@@ -128,14 +163,15 @@ public final class OutboundGuard {
      * filter that never ran look identical from the outside, which is how the inbound
      * filter's mixin-ordering defect survived. Here the only user-visible symptom is "tab does
      * nothing", far too quiet to diagnose on its own. The cost of the prefix rule is that a
-     * genuinely distinct root which happens to extend a reported one ({@code banip} after
-     * {@code ban}) is not reported separately; one visible line per session per command
-     * <em>family</em> is enough to answer "did the guard fire", and the config screen's toggle
-     * is where the rest of the answer is.
+     * genuinely distinct root which happens to extend a reported one that has already reached
+     * the threshold ({@code banip} after {@code ban}) is not reported separately; one visible
+     * line per session per command <em>family</em> is enough to answer "did the guard fire",
+     * and the config screen's toggle is where the rest of the answer is.
      *
-     * <p>Nothing is ever cleared. The set is bounded by the pairwise prefix-incomparable roots
-     * typed in a session -- exactly one, in the keystroke-harvest case above -- and a repeat
-     * line after a reconnect would add nothing the first one did not already say.
+     * <p>Nothing is ever cleared. The set stays bounded: per family, at most one entry shorter
+     * than {@link #MIN_PLAUSIBLE_ROOT_LENGTH} (there is only one possible first character for
+     * any one typed word) plus one prefix-incomparable entry at or past it, and a repeat line
+     * after a reconnect would add nothing the first one did not already say.
      */
     private static void logFirstSuggestionBlock(String root) {
         if (root.isEmpty()) {
@@ -155,6 +191,19 @@ public final class OutboundGuard {
         if (!recordSuggestionRoot(root)) {
             return;
         }
+        if (root.length() < MIN_PLAUSIBLE_ROOT_LENGTH) {
+            CmdGuardClient.LOGGER.info(
+                    "[cmdguard] withheld the tab-completion request for \"{}\" -- that root is"
+                            + " not on your allowlist, and a completion request puts the partial"
+                            + " command on the wire just as running it would. This is only the"
+                            + " first character typed so far; a longer command will still get"
+                            + " its own line once it is a couple of characters in. Run"
+                            + " \"/cmdguard allow <root>\" with the whole command root to allow"
+                            + " it and its completions, or switch the suggestion guard off in the"
+                            + " config screen.",
+                    root);
+            return;
+        }
         CmdGuardClient.LOGGER.info(
                 "[cmdguard] withheld the tab-completion request for \"{}\" -- that root is not on"
                         + " your allowlist, and a completion request puts the partial command on"
@@ -168,23 +217,34 @@ public final class OutboundGuard {
 
     /**
      * Adds {@code root} to {@link #REPORTED_SUGGESTION_ROOTS} and returns true, unless it is
-     * prefix-comparable with something already there -- in which case nothing is added and it
-     * returns false.
+     * suppressed by something already there -- in which case nothing is added and it returns
+     * false.
      *
-     * <p>Both directions are checked. A reported root that is a prefix of this one is the
-     * keystroke-by-keystroke case ({@code s} then {@code so}); this one being a prefix of a
-     * reported root is the same typing done in the other order, after a backspace or a
-     * retype. Not adding in the second case is deliberate: the entries that survive are the
-     * shortest of each family, which is what keeps the set from growing along one command.
+     * <p>An exact repeat of an already-reported root is always suppressed, whatever its
+     * length -- that is simple deduplication, not a family judgement. Beyond that, a reported
+     * root only suppresses a <em>different</em> root, via the prefix check in either
+     * direction, once that reported root is at least {@link #MIN_PLAUSIBLE_ROOT_LENGTH}
+     * characters long. A reported root that is a prefix of this one and long enough is the
+     * keystroke-by-keystroke case ({@code so} then {@code some}); this one being a prefix of
+     * such a reported root is the same typing done in the other order, after a backspace or a
+     * retype. A reported root shorter than the threshold (necessarily a single character,
+     * since the empty root never reaches here) is kept only so a later exact repeat of that
+     * same single character is still deduped -- it is never used to suppress a longer or
+     * shorter root that merely happens to share it, which is the defect this threshold exists
+     * to fix. See {@link #logFirstSuggestionBlock} for the scenario and the width chosen.
      *
-     * <p>Package-private so {@code OutboundGuardSuggestionLogTest} can drive the dedupe
+     * <p>Package-private so {@code SuggestionLogDedupeTest} can drive the dedupe
      * without a game client. {@link #resetSuggestionLogForTest()} is there for the same
      * reason; nothing in the mod calls either.
      */
     static boolean recordSuggestionRoot(String root) {
         synchronized (REPORTED_SUGGESTION_ROOTS) {
             for (String reported : REPORTED_SUGGESTION_ROOTS) {
-                if (root.startsWith(reported) || reported.startsWith(root)) {
+                if (reported.equals(root)) {
+                    return false;
+                }
+                if (reported.length() >= MIN_PLAUSIBLE_ROOT_LENGTH
+                        && (root.startsWith(reported) || reported.startsWith(root))) {
                     return false;
                 }
             }
