@@ -4,12 +4,17 @@ import net.minecraft.client.Minecraft;
 import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.network.protocol.game.ClientGamePacketListener;
+import net.minecraft.network.protocol.game.ClientboundBundlePacket;
 import net.minecraft.resources.Identifier;
 import studios.creeperdiamonds.cmdguard.CmdGuardClient;
 import studios.creeperdiamonds.cmdguard.GuardConfig;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -423,6 +428,104 @@ public final class ExposureGuard {
             CmdGuardClient.LOGGER.error("[cmdguard] inbound check failed, withholding", e);
             return false;
         }
+    }
+
+    /**
+     * Returns {@code bundle} with every withheld custom-payload sub-packet removed, or the
+     * very same object when nothing needed removing.
+     *
+     * <p><b>Why this exists at all.</b> {@code ConnectionMixin}'s inbound {@code instanceof
+     * ClientboundCustomPayloadPacket} test is not enough on its own, because in the play
+     * protocol a custom payload does not have to arrive as its own pipeline message.
+     * Verified 2026-08-29 against the decompiled 1.21.11 sources and the mapped merged jar
+     * (see {@code NOTES.md}, "Inbound: packet bundles"): the play clientbound protocol is
+     * the only protocol with a non-null {@code ProtocolInfo#bundlerInfo()}, so {@code
+     * Connection#setupInboundProtocol} installs a {@code PacketBundlePacker} as {@code
+     * "bundler"} directly after {@code "decoder"} and therefore ahead of {@code
+     * "packet_handler"}; that handler swallows every packet between two {@code
+     * ClientboundBundleDelimiterPacket}s and emits a single {@code ClientboundBundlePacket}
+     * in their place. {@code channelRead0} then sees only the bundle. {@code
+     * ClientPacketListener#handleBundlePacket} unpacks it on the client thread with a plain
+     * {@code subPacket.handle(this)} per sub-packet -- which for a bundled {@code
+     * ClientboundCustomPayloadPacket} lands straight in {@code
+     * ClientCommonPacketListenerImpl#handleCustomPayload}, i.e. in Fabric API's addon
+     * dispatch, without ever passing the inbound filter again. {@code
+     * CommonPacketTypes.CLIENTBOUND_CUSTOM_PAYLOAD} is registered in the play clientbound
+     * protocol and {@code Packet#isTerminal()} is false for it, so the bundler will accept
+     * one: a server that wants to probe a client can simply wrap its probe in a bundle.
+     *
+     * <p><b>Removal only, and only of custom payloads.</b> Bundles are how vanilla batches
+     * entity spawn traffic, so dropping an arbitrary sub-packet would break the game and
+     * dropping the whole bundle would take unrelated packets with it. Nothing is ever added
+     * or altered here -- {@link ClientboundBundlePacket} is rebuilt from a list that is a
+     * subset of its own sub-packets, in the original order. That keeps this inside the same
+     * no-fabrication rule as {@link IdentifierFilter}: withholding is silence.
+     *
+     * <p><b>An emptied bundle is emitted, not cancelled, and that is safe.</b> Read, not
+     * assumed: {@code subPackets()} has exactly two callers in the game (verified by
+     * grepping the decompiled sources) -- {@code ClientPacketListener#handleBundlePacket},
+     * whose body is {@code ensureRunningOnSameThread} followed by a bare for-each, and
+     * {@code BundlerInfo.unbundlePacket}, which is the server's outbound path and is never
+     * reached here. An empty bundle therefore runs the for-each zero times and does nothing
+     * at all; no code path asserts a non-empty bundle. Emitting it rather than cancelling
+     * keeps the decision in one place and leaves {@code Connection}'s {@code receivedPackets}
+     * counter honest.
+     *
+     * <p><b>Fail closed.</b> A sub-packet whose channel id cannot even be read is withheld
+     * rather than kept (see {@link #allowBundledPayload}), and {@link #allowInbound} already
+     * withholds on any exception of its own, so the loop itself cannot throw. If iterating
+     * the bundle or rebuilding it throws anyway, the exception is logged and rethrown: it
+     * propagates out of {@code channelRead0} into {@code Connection#exceptionCaught}, which
+     * disconnects. That loses the connection, which is the point -- the alternative is
+     * handing the listener a bundle this method could not filter. It is not a path vanilla
+     * or Fabric API can reach: both build a bundle's sub-packet list as an {@code ArrayList}
+     * ({@code BundlerInfo.createForPacket}'s bundler, and Fabric API 0.141.6's {@code
+     * BundlePacketMixin}, which flattens nested bundles into one at {@code BundlePacket}'s
+     * constructor).
+     */
+    public static Packet<?> filterBundle(ClientboundBundlePacket bundle, Snapshot snapshot) {
+        if (!snapshot.active() || !snapshot.filterInbound()) {
+            return bundle;
+        }
+        try {
+            List<Packet<? super ClientGamePacketListener>> kept = new ArrayList<>();
+            boolean removed = false;
+            for (Packet<? super ClientGamePacketListener> sub : bundle.subPackets()) {
+                if (sub instanceof ClientboundCustomPayloadPacket custom
+                        && !allowBundledPayload(custom, snapshot)) {
+                    removed = true;
+                    continue;
+                }
+                kept.add(sub);
+            }
+            return removed ? new ClientboundBundlePacket(kept) : bundle;
+        } catch (RuntimeException e) {
+            CmdGuardClient.LOGGER.error(
+                    "[cmdguard] bundle filter failed; refusing to deliver an unfiltered bundle", e);
+            throw e;
+        }
+    }
+
+    /**
+     * {@link #allowInbound} for a sub-packet, with the channel-id read itself guarded.
+     *
+     * <p>{@code allowInbound} can only fail closed once it has an {@code Identifier}; reading
+     * one out of a payload is an interface call into whatever implemented {@code
+     * CustomPacketPayload}, so it is the one step in {@link #filterBundle}'s loop that could
+     * throw. Treating a payload whose own channel cannot be read as withheld keeps the loop
+     * total and is the correct direction: the packet dropped here is a custom payload, which
+     * is the only kind of sub-packet this filter is ever allowed to drop.
+     */
+    private static boolean allowBundledPayload(ClientboundCustomPayloadPacket custom, Snapshot snapshot) {
+        Identifier channel;
+        try {
+            channel = custom.payload().type().id();
+        } catch (RuntimeException e) {
+            CmdGuardClient.LOGGER.error(
+                    "[cmdguard] could not read a bundled payload's channel, withholding it", e);
+            return false;
+        }
+        return allowInbound(channel, snapshot);
     }
 
     private static String channelOf(ServerboundCustomPayloadPacket packet) {

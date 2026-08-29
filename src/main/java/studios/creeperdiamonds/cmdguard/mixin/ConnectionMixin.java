@@ -6,6 +6,7 @@ import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import net.minecraft.network.protocol.game.ClientboundBundlePacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -242,5 +243,45 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
             CmdGuardClient.LOGGER.error("[cmdguard] inbound drop check failed, withholding", e);
             ci.cancel();
         }
+    }
+
+    /**
+     * The second half of the inbound choke point: a play-phase custom payload does not have
+     * to arrive as its own pipeline message.
+     *
+     * <p>{@link #cmdguard$dropWithheldInbound} above matches on the message {@code
+     * channelRead0} is handed, and that is enough only while one pipeline message means one
+     * packet. In the play protocol it does not. Verified 2026-08-29 against the decompiled
+     * 1.21.11 sources and the mapped merged jar (see {@code NOTES.md}, "Inbound: packet
+     * bundles"): the play clientbound protocol is the only one whose {@code ProtocolInfo}
+     * carries a {@code BundlerInfo}, so {@code Connection#setupInboundProtocol} installs a
+     * {@code PacketBundlePacker} as {@code "bundler"} immediately after {@code "decoder"} --
+     * upstream of the {@code "packet_handler"} that is this {@code Connection} -- and that
+     * handler replaces everything between two {@code ClientboundBundleDelimiterPacket}s with
+     * one {@code ClientboundBundlePacket}. The sub-packets never arrive here individually;
+     * {@code ClientPacketListener#handleBundlePacket} calls {@code subPacket.handle(this)} on
+     * each of them later, on the client thread, which for a custom payload is
+     * {@code handleCustomPayload} and hence Fabric API's addon dispatch. Matching only the
+     * bare packet left a bundled payload completely unfiltered.
+     *
+     * <p>A {@code @ModifyVariable} rather than a cancel, deliberately: the bundle is mostly
+     * entity traffic and cancelling it would drop packets this mod has no business touching.
+     * {@link ExposureGuard#filterBundle} rebuilds the bundle from a subset of its own
+     * sub-packets -- removal only, never an addition, never a non-payload sub-packet -- and
+     * returns the original object untouched when nothing was withheld.
+     *
+     * <p>This and {@link #cmdguard$dropWithheldInbound} both attach at {@code HEAD} and their
+     * relative order is not defined, which is fine because they match disjoint packet types:
+     * a {@code ClientboundBundlePacket} is never a {@code ClientboundCustomPayloadPacket}.
+     * Same pairing as the outbound {@code sendPacket} handlers above.
+     */
+    @ModifyVariable(method = "channelRead0(Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;)V",
+            at = @At("HEAD"), argsOnly = true, ordinal = 0)
+    private Packet<?> cmdguard$filterBundledPayloads(Packet<?> packet) {
+        if (getReceiving() != PacketFlow.CLIENTBOUND
+                || !(packet instanceof ClientboundBundlePacket bundle)) {
+            return packet;
+        }
+        return ExposureGuard.filterBundle(bundle, cmdguard$snapshot());
     }
 }
