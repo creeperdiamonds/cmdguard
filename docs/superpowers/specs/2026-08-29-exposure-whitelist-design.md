@@ -139,28 +139,35 @@ and then unregisters it has disclosed `somemod` just as surely as advertising it
 
 ### Rewriting a payload
 
-This is the hardest part of the implementation and the earlier draft skipped it.
+A byte-level rewrap is not reachable, and an earlier draft of this spec was wrong to
+propose one. Fabric's `CustomPayloadPacketCodecMixin` wraps `findCodec(identifier)`:
+encoding resolves the codec **by channel id** and then casts the payload to that codec's
+type. A generic `(Identifier, byte[])` payload sent under `minecraft:register` would be
+handed `RegistrationPayload`'s codec and fail on the cast, and under a fresh id it would
+have no registered client-to-server codec at all. The idea is dropped.
 
-At `Connection#send` the payload is already a typed Fabric record, not bytes, and
-depending on Fabric's internal record types is what `RawPayload` exists to avoid. The
-route: serialize the outgoing payload through its own codec into a `FriendlyByteBuf`,
-apply the filter at byte level, and re-wrap the result as a `RawPayload` carrying the
-same channel id. Fabric's types are never named or imported.
+Instead the guard matches the outgoing payload against the five rewritable types and
+constructs a filtered instance of the same record. All five are public records with
+public canonical constructors, reachable on the compile classpath:
 
-Byte-level filtering needs the wire layout preceding the identifier collection. All five
-rewritable channels, read from source:
-
-| Channel | Prefix before the collection |
+| Channel | Record and constructor |
 | --- | --- |
-| `minecraft:register`, `minecraft:unregister` | none - NUL-separated ASCII, whole body |
-| `c:register` | varint version, UTF phase |
-| `fabric:accepted_attachments_v1` | none |
-| `fabric:recipe_sync/supported_serializers` | none |
-| `fabric:custom_ingredient_sync` | varint protocolVersion |
+| `minecraft:register`, `minecraft:unregister` | `RegistrationPayload(Type<RegistrationPayload> id, List<Identifier> channels)` |
+| `c:register` | `CommonRegisterPayload(int version, String phase, Set<Identifier> channels)` |
+| `fabric:accepted_attachments_v1` | `AcceptedAttachmentsPayloadC2S(Set<Identifier> acceptedAttachments)` |
+| `fabric:recipe_sync/supported_serializers` | `SupportedRecipeSerializersPayloadC2S(Set<Identifier> synchronizedSerializers)` |
+| `fabric:custom_ingredient_sync` | `CustomIngredientPayloadC2S(int protocolVersion, Set<Identifier> registeredSerializers)` |
 
-Collections are a varint count followed by that many identifiers. A channel with no entry
-in this table is never rewritten - only passed or dropped - so an unrecognised wire format
-cannot corrupt a packet.
+Non-identifier fields are copied through unchanged. A payload matching none of these types
+is never rewritten - only passed or dropped - so an unfamiliar payload cannot be corrupted.
+
+This trades a byte parser for a compile-time dependency on five Fabric `impl` classes,
+which are explicitly unstable API. That is the better trade here. The versions are pinned
+in `gradle.properties`, so a Fabric API bump that moves or reshapes these records is a
+**compile error**, not a jar that silently stops filtering - the same fail-closed property
+the mixin config already relies on. `fabric.mod.json` additionally declares a strict
+`fabric-api` dependency, so a user running a different Fabric API version gets a clean
+refusal to start rather than a crash partway through a handshake.
 
 ### Components
 
@@ -169,19 +176,18 @@ Pure, no Minecraft imports, unit-testable without a client:
 - `ExposurePolicy` - immutable. `decide(channelId, serverKey)` returns `EXPOSE` or
   `WITHHOLD` from the exposed-namespace set, the per-server grants, and the channel-level
   refinements. Any throw is caught and treated as `WITHHOLD`.
-- `RegistrationFilter` - filters `minecraft:register` and `minecraft:unregister` bodies
-  (NUL-separated ASCII). Bytes in, bytes out.
-- `IdentifierSetFilter` - filters a varint-counted identifier collection behind a known
-  prefix, per the wire-layout table above. Covers `c:register` and the three leaky Fabric
-  payloads; the prefix is copied through untouched.
+- `IdentifierFilter` - `retainExposed(Collection<String>, ExposurePolicy)` returns the
+  subset whose entries the policy exposes, order preserved, never adding an entry absent
+  from the input. Every rewrite is expressed as one call to this.
 - `ChannelLedger` - the record of channels observed and their last decision. Persisted,
   read by `/cmdguard exposure`, and never consulted by the filter.
 
 Minecraft-facing, kept thin:
 
-- `RawPayload` - a `(Identifier, byte[])` `CustomPacketPayload` so rewritten payloads go
-  out as plain bytes, with no dependency on Fabric's internal payload types, which would
-  break on every Fabric API bump.
+- `PayloadRewriter` - matches an outgoing payload against the five rewritable record types
+  and returns a filtered instance of the same record, or the original unchanged when it
+  matches none. The only file that imports Fabric `impl` types, so the unstable surface
+  sits in one place.
 - `ExposureGuard` - the facade the mixins call. Returns the packet, a rewritten packet,
   or null to cancel. Holds the connection's policy snapshot and feeds the ledger.
 - `ConnectionMixin`, plus inbound handling on the existing `ClientPacketListenerMixin`.
@@ -277,12 +283,13 @@ will say so in those words.
 
 `build.gradle` has no test setup. Add JUnit 5 and a CI test step.
 
-Covered: `ExposurePolicy` decisions including the unknown-namespace default;
-`RegistrationFilter` round-trips for both codecs; `IdentifierSetFilter`; a test
-asserting `minecraft:brand` is never withheld or modified; a test asserting no filter
-ever emits a channel or identifier absent from its input (the no-fabrication boundary,
-enforced by code rather than intent); a test asserting the advertisement/enforcement
-invariant.
+Covered: `ExposurePolicy` decisions, including the unknown-namespace default, the
+malformed-identifier default, and precedence between namespace grants and channel-level
+refinements; `IdentifierFilter`; a test asserting `minecraft:brand` is never withheld;
+a test asserting the filter never emits an entry absent from its input (the
+no-fabrication boundary, enforced by code rather than intent); a test asserting the
+advertisement/enforcement invariant - every channel the filter would strip from a
+registration is one the policy also withholds in both directions.
 
 Not covered: mixins and Minecraft-facing code. There is no Minecraft client on the build
 machine. This is a real gap, stated rather than papered over.
