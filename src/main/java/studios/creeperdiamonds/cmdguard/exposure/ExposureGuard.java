@@ -1,7 +1,6 @@
 package studios.creeperdiamonds.cmdguard.exposure;
 
 import net.minecraft.client.Minecraft;
-import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
@@ -12,6 +11,7 @@ import studios.creeperdiamonds.cmdguard.GuardConfig;
 
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * The facade the mixins call. Everything here fails closed: if a decision cannot be made,
@@ -39,6 +39,16 @@ public final class ExposureGuard {
 
     private static final ChannelLedger LEDGER = new ChannelLedger();
 
+    /**
+     * The server key captured by {@code ConnectScreenMixin} at the moment a multiplayer
+     * join begins -- before any {@code Connection} exists. See {@link #rememberServerKey}
+     * for why this cannot instead be derived later from {@link Minecraft#getCurrentServer()}.
+     * Consumed exactly once per connection by {@link #beginConnection}, which resets it to
+     * {@code null} in the same step so a singleplayer session started right after a
+     * multiplayer one can never inherit that server's grants.
+     */
+    private static final AtomicReference<String> REMEMBERED_SERVER_KEY = new AtomicReference<>();
+
     private ExposureGuard() {
     }
 
@@ -54,8 +64,18 @@ public final class ExposureGuard {
      * filtering, say, the configuration phase of a connection but not its play phase: once
      * a connection has its snapshot, that connection sees one consistent answer for its
      * whole lifetime, and a live edit takes effect starting with the next connection.
+     *
+     * <p>{@code serverKey} is the key this connection's policy was actually built against
+     * -- {@code "singleplayer"}, or the lowercased server address remembered by {@link
+     * #rememberServerKey} at connect time. Carried on the snapshot, rather than left for a
+     * caller to re-derive later, because the only other source -- {@link
+     * Minecraft#getCurrentServer()} -- returns {@code null} for the entire configuration
+     * phase (see {@link #rememberServerKey}'s Javadoc); a later task writing per-server
+     * grants needs the key this connection is actually judged against, not a best-effort
+     * re-guess. {@code null} only for {@link #globalsOnlySnapshot()}, which is a fallback
+     * that by construction never learns which server it is talking to.
      */
-    public record Snapshot(boolean active, boolean filterInbound, ExposurePolicy policy) {
+    public record Snapshot(boolean active, boolean filterInbound, ExposurePolicy policy, String serverKey) {
     }
 
     /**
@@ -72,12 +92,63 @@ public final class ExposureGuard {
     }
 
     /**
-     * Entry point for the connection lifecycle (wired by a later task): called once per new
-     * connection, on the client thread. Resets the ledger for the new session -- the ledger
-     * is deliberately global and outlives a disconnect (see {@link ChannelLedger}'s
-     * Javadoc), so it must be cleared explicitly at the *start* of the next connection
-     * rather than at the end of the last one -- and pushes a fresh per-connection snapshot
-     * onto {@code connection}.
+     * Called on the client thread, before any {@code Connection} exists for the join in
+     * progress -- from {@code ConnectScreenMixin}, at the {@code HEAD} of {@code
+     * ConnectScreen#startConnecting}, which runs on the client thread (it calls {@code
+     * minecraft.setScreen}) and strictly before the socket opens on the separate "Server
+     * Connector #N" thread.
+     *
+     * <p><b>Why this can't wait until later, e.g. a re-read of {@code
+     * Minecraft#getCurrentServer()} from inside the connection lifecycle:</b> in 1.21.11
+     * that method is {@code Optionull.map(this.getConnection(), ClientPacketListener::
+     * getServerData)}, and {@code getConnection()} returns the *play* listener -- which
+     * does not exist for the entire configuration phase, exactly when every Fabric API
+     * client-to-server payload is sent (see {@code NOTES.md}). Deriving the server key any
+     * later than this method silently yields {@code "singleplayer"} for every real server
+     * during that whole phase, which would mean per-server grants never apply to the
+     * traffic this feature exists to filter. Capturing the key here, before the {@code
+     * Connection} object is even constructed, is what avoids that hole.
+     *
+     * <p>Stores into {@link #REMEMBERED_SERVER_KEY} for {@link #beginConnection} to consume
+     * exactly once. Fails closed on the thread contract: if this is somehow called off the
+     * client thread, the remembered key is discarded (not left stale, not trusted) and the
+     * upcoming connection falls back to {@code "singleplayer"} in {@link #beginConnection}
+     * -- stricter than the real per-server policy could be, never more permissive.
+     *
+     * @param ip the {@code ServerData.ip} of the server being connected to; {@code null} is
+     *           tolerated (treated the same as never having called this).
+     */
+    public static void rememberServerKey(String ip) {
+        Minecraft client = Minecraft.getInstance();
+        if (client == null || !client.isSameThread()) {
+            CmdGuardClient.LOGGER.error(
+                    "[cmdguard] rememberServerKey called off the client thread; discarding it "
+                            + "so the upcoming connection falls back to \"singleplayer\" instead of "
+                            + "risking a stale or wrong server key");
+            REMEMBERED_SERVER_KEY.set(null);
+            return;
+        }
+        REMEMBERED_SERVER_KEY.set(ip == null ? null : ip.toLowerCase(Locale.ROOT));
+    }
+
+    /**
+     * Entry point for the connection lifecycle: called once per new connection. No longer
+     * required to run on the client thread -- unlike {@link #rememberServerKey}, this
+     * method touches no {@code Minecraft} state at all, only {@link #REMEMBERED_SERVER_KEY}
+     * (a plain {@code AtomicReference} this class owns) and the {@link ChannelLedger}, so it
+     * is safe to call from wherever the connection's constructor happens to run.
+     *
+     * <p>Consumes the remembered key <em>exactly once</em> -- reads it and resets it to
+     * {@code null} in the same atomic step via {@link AtomicReference#getAndSet} -- and
+     * defaults to {@code "singleplayer"} when none is set. One-shot consumption is
+     * deliberate: it is what stops a singleplayer session that follows a multiplayer one
+     * from inheriting that server's grants, without needing a second mixin on disconnect to
+     * clear it.
+     *
+     * <p>Resets the ledger for the new session -- the ledger is deliberately global and
+     * outlives a disconnect (see {@link ChannelLedger}'s Javadoc), so it must be cleared
+     * explicitly at the *start* of the next connection rather than at the end of the last
+     * one -- and pushes a fresh per-connection snapshot onto {@code connection}.
      *
      * <p>Safe to never call: if this is skipped, or a packet is sent before it runs,
      * {@code ConnectionMixin} falls back to {@link #globalsOnlySnapshot()} lazily on first
@@ -87,25 +158,13 @@ public final class ExposureGuard {
      * @param connection the {@code Connection} instance for the new session. Typed as
      *                    {@code Object} would also work via {@code ConnectionInit}, but
      *                    taking the real type lets the compiler catch a wrong call site.
-     * @param serverKey   must be computed on the client thread via {@link #currentServerKey()}
-     *                    -- see that method's Javadoc for why.
      */
-    public static void beginConnection(Connection connection, String serverKey) {
-        Minecraft client = Minecraft.getInstance();
-        LEDGER.reset();
-        if (client == null || !client.isSameThread()) {
-            // Enforce the documented contract rather than trust the caller: reading Minecraft
-            // state (which serverKey was presumably computed from) off the client thread is
-            // exactly the stale-read defect this class's Javadoc warns about. Deliberately do
-            // NOT call cmdguard$initExposure here -- leaving the connection's snapshot field
-            // unset lets ConnectionMixin's own lazy fallback install globalsOnlySnapshot() on
-            // first use, which is strictly stricter than any per-server policy and safe from
-            // any thread.
-            CmdGuardClient.LOGGER.error(
-                    "[cmdguard] beginConnection called off the client thread; "
-                            + "leaving this connection on the globals-only fallback snapshot");
-            return;
+    public static void beginConnection(Connection connection) {
+        String serverKey = REMEMBERED_SERVER_KEY.getAndSet(null);
+        if (serverKey == null) {
+            serverKey = "singleplayer";
         }
+        LEDGER.reset();
         if (connection instanceof ConnectionInit init) {
             init.cmdguard$initExposure(serverKey);
         }
@@ -117,7 +176,8 @@ public final class ExposureGuard {
         return new Snapshot(
                 config.enabled && config.exposure.enabled,
                 config.exposure.filterInbound,
-                config.exposure.policyFor(serverKey));
+                config.exposure.policyFor(serverKey),
+                serverKey);
     }
 
     /**
@@ -133,6 +193,13 @@ public final class ExposureGuard {
      * {@code minecraft:register}, which stops the server's registry sync and breaks joining
      * a modded server outright. Globals-only is the correct middle ground: stricter than
      * the configured policy might otherwise be, but still lets a normal join complete.
+     *
+     * <p>{@code serverKey} is {@code null} on the returned snapshot: by definition this
+     * fallback runs precisely when no real key has been established for the connection yet
+     * (either {@link #beginConnection} has not run, or it consumed no remembered key), so
+     * there is nothing genuine to report. A caller that writes per-server state (e.g. a
+     * future {@code /cmdguard expose}) must treat a {@code null} serverKey as "not yet
+     * known" and must not use it as a real key.
      */
     public static Snapshot globalsOnlySnapshot() {
         GuardConfig config = GuardConfig.get();
@@ -140,24 +207,7 @@ public final class ExposureGuard {
                 config.exposure.exposedNamespaces,
                 config.exposure.exposedChannels,
                 config.exposure.withheldChannels);
-        return new Snapshot(config.enabled && config.exposure.enabled, config.exposure.filterInbound, policy);
-    }
-
-    /**
-     * Must be called from the client thread. It reads {@code Minecraft.getInstance()} and
-     * the current {@code ServerData}, both of which the game only guarantees to be
-     * consistent when read from the thread that owns them; reading them from the netty
-     * event loop with no happens-before edge back to the client thread can observe a stale
-     * value (e.g. the previous server, after the player has already moved on), and that
-     * stale read is not self-correcting once frozen into a connection's snapshot.
-     */
-    public static String currentServerKey() {
-        Minecraft client = Minecraft.getInstance();
-        ServerData server = client == null ? null : client.getCurrentServer();
-        if (server == null || server.ip == null) {
-            return "singleplayer";
-        }
-        return server.ip.toLowerCase(Locale.ROOT);
+        return new Snapshot(config.enabled && config.exposure.enabled, config.exposure.filterInbound, policy, null);
     }
 
     /** True when this packet must not leave the client at all. */
