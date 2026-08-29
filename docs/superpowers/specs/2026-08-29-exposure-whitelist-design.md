@@ -235,10 +235,17 @@ test.
 
 Fail closed, and never fail silently.
 
-- `cmdguard.mixins.json` already sets `"required": true` and `defaultRequire: 1`. A
-  mapping change breaks the build rather than shipping a jar whose guard silently does
-  nothing. Mapped signatures cannot be verified on the build machine - there is no local
-  Loom cache - so this is the mechanism that catches a wrong guess.
+- `cmdguard.mixins.json` sets `"required": true` and `defaultRequire: 1`, so a mixin that
+  fails to find its target refuses to load rather than silently doing nothing.
+
+  **Correction to an earlier draft of this spec.** That draft claimed a mapping change
+  "breaks the build". It does not, and this was tested: pointing an `@Inject` at a
+  nonexistent method still produces `BUILD SUCCESSFUL`. Mixin application happens at
+  launch, not at compile time, so a wrong target is a **launch-time crash**, not a build
+  failure. The failure is still loud and still fails closed - the mod does not load, so it
+  cannot pretend to guard - but a green build, in CI or locally, is not evidence that any
+  mixin target is correct. Only running the game proves that, which makes the manual
+  acceptance run the sole check on every mapped signature this mod depends on.
 - A throw inside the policy withholds.
 - Join-time chat line reports the counts: exposed, withheld.
 - `/cmdguard exposure` lists every channel in the ledger as EXPOSED or WITHHELD with the
