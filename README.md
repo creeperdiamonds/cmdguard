@@ -29,6 +29,10 @@ advertises a channel or identifier the client does not actually have. See
   inbound traffic on channels outside the default namespace set is withheld unless you
   allow it. `/cmdguard exposure` shows the readout. See
   [Exposure whitelist](#exposure-whitelist) below.
+- **Login-query withholding.** A server can probe for a specific mod with a single login
+  query, before you have joined anything, and a mod that answers gives itself away.
+  CmdGuard lets vanilla's own empty reply stand instead. See
+  [The login phase](#the-login-phase).
 
 ## Commands
 
@@ -87,9 +91,8 @@ See [NOTES.md](NOTES.md) for the developer-facing hazard table.
 
 By default, CmdGuard withholds every channel outside the `fabric`, `minecraft`, and `c`
 namespaces, in both directions — outbound (what your client advertises or sends) and
-inbound (what a server sends you on that channel) — throughout the configuration and play
-phases of a connection. **The login phase is not covered**; see
-[What is not covered](#what-is-not-covered) below. This includes the identifier lists
+inbound (what a server sends you on that channel) — throughout all three phases of a
+connection: login, configuration and play. This includes the identifier lists
 carried inside three of Fabric API's own payloads: the accepted-attachments,
 recipe-serializer, and custom-ingredient sync messages, each of which otherwise names
 every third-party mod that registered one. Everything outside those three namespaces is
@@ -144,24 +147,59 @@ instead of just that one connection. This covers more than ordinary multiplayer:
   early in a connection, before the per-connection key is established, that runs on global
   grants only; you cannot type a command during it, so you will never meet it.)
 
+## The login phase
+
+The login phase runs before configuration and play, and it is the one place a server can
+probe you before you have joined anything. It works differently enough to be worth its own
+section.
+
+A server can send a *login query* on any channel. A vanilla client always replies `null`,
+without even looking at the channel. A client with a mod that registered a handler for
+that channel replies with a real payload. **Answering at all, rather than what the answer
+says, is the disclosure** — one login query tells the server whether you have that mod.
+
+CmdGuard withholds the answer for a channel you have not exposed, and it does so by
+letting *vanilla* answer instead of the mod: the query is passed through with its payload
+replaced by the "unrecognised channel" payload vanilla itself produces, so the reply that
+goes on the wire is vanilla's own empty one, with the transaction id intact. CmdGuard
+sends no packet of its own and cancels nothing. The empty reply is a refusal, not a lie:
+it is the protocol's own "there is no payload" value, it names no channel, it is what
+every vanilla client sends, and it is byte-for-byte what Fabric's own API sends when a
+mod's handler declines.
+
+Dropping the query outright would not be silence — nothing on either side keeps track of
+an unanswered query, so the server just waits, and after 30 seconds you get a "Timed out"
+disconnect. A client that hangs stands out more than one that answers, so CmdGuard does
+not do that.
+
+**Two things to know if a join breaks.**
+
+- **The remedy is the *global* form of the command.** The login phase happens before the
+  connection has a server identity to hang a grant on, so per-server grants cannot apply
+  to it — only global ones. If a server's handshake genuinely needs a mod's real answer,
+  run **`/cmdguard expose global <namespace>`** and reconnect. `/cmdguard expose
+  <namespace>` (without `global`) will not help here, however right it looks.
+- **Look in `latest.log`.** A server that refuses the join over a withheld login answer
+  shows you *its* disconnect screen, which says nothing about CmdGuard. There is no chat
+  left to write to and `/cmdguard exposure` needs a connection, so every withheld login
+  answer is written to `latest.log` as a `WARN` naming the channel and the exact command
+  to run. That line is the only place the cause appears.
+
+You can switch this off on its own — "Login queries" in the Mod Menu settings screen —
+without disabling the rest of the exposure whitelist. It is on by default.
+
 ## What is not covered
 
-**The login phase.** Everything above applies to the configuration and play phases of a
-connection. It does not apply to the login phase, which runs before either and uses a
-different pair of packets — `ClientboundCustomQueryPacket` and
-`ServerboundCustomQueryAnswerPacket`, neither of which is the custom-payload packet
-CmdGuard filters — handled by a listener that shares no base class with the ones CmdGuard
-hooks.
+**Behavioural fingerprinting.** CmdGuard controls what your client *says*, not how it
+behaves. Timing, capabilities, and which features work are out of scope, and a server that
+studies them can still draw conclusions. See [NOTES.md](NOTES.md) for the developer-facing
+detail.
 
-That matters because of how Fabric API answers a login query: a vanilla client always
-replies `null`, while a client with a mod that registered a login-query handler for that
-channel replies with a payload. **Answering at all, rather than what the answer says, is
-already the disclosure** — so a server that sends a login query on a mod's channel can
-learn whether you have that mod, and CmdGuard does not currently stop it.
-
-This is a design change rather than a fix — withholding a login answer means deciding what
-to send in its place, and CmdGuard does not fabricate — so it is written down here rather
-than papered over. See [NOTES.md](NOTES.md).
+**None of this has been tested in a running game.** There is no Minecraft client on the
+machine this is developed on. The interception points are verified against the decompiled
+1.21.11 sources and the mapped jar, and the decision logic is unit-tested, but Fabric
+mixins are applied at launch — so a successful build is evidence of compilation and
+nothing more. This is stated rather than papered over.
 
 ## Building
 

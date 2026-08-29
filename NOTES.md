@@ -16,27 +16,25 @@ API branch `1.21.11`. This project uses **official Mojang mappings**.
 
 ## Known hazards
 
-### The login phase is not covered
+### The login phase — now covered, and the one hazard that can cost a join
 
 Verified 2026-08-29 against the same decompiled 1.21.11 sources and the Fabric API 0.141.6
-sources pinned in `gradle.properties`.
+sources pinned in `gradle.properties`. The investigation is
+`.superpowers/sdd/login-phase-spike.md`; this is the summary and the residual hazard.
 
-The exposure layer covers the configuration and play phases and nothing else. Two
-independent reasons, both structural:
+**Why the login phase needed separate work.** It uses a different pair of packets from the
+configuration and play phases. `ClientboundCustomQueryPacket` is not a
+`ClientboundCustomPayloadPacket`, and `ServerboundCustomQueryAnswerPacket` is
+`record ServerboundCustomQueryAnswerPacket(int transactionId, @Nullable
+CustomQueryAnswerPayload payload) implements Packet<ServerLoginPacketListener>` — not a
+`ServerboundCustomPayloadPacket`. So both `instanceof` tests in `ExposureGuard` skipped
+them even though both hooks saw the packets go past.
+`net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl` is declared
+`implements ClientLoginPacketListener` and extends none of this mod's mixin targets, so no
+listener-level hook reaches it either.
 
-- `net.minecraft.client.multiplayer.ClientHandshakePacketListenerImpl` is declared
-  `implements ClientLoginPacketListener` — it extends **none** of this mod's mixin targets,
-  so no listener-level hook reaches it.
-- The login phase's packets are a different pair. `ServerboundCustomQueryAnswerPacket` is
-  `record ServerboundCustomQueryAnswerPacket(int transactionId, @Nullable
-  CustomQueryAnswerPayload payload) implements Packet<ServerLoginPacketListener>` — **not**
-  a `ServerboundCustomPayloadPacket`, so `ExposureGuard.shouldDrop`'s `instanceof` skips it
-  even though the `Connection#sendPacket` hook does see it go past. Inbound,
-  `ClientboundCustomQueryPacket` is likewise not a `ClientboundCustomPayloadPacket`, so the
-  `channelRead0` hook skips it too.
-
-Why that is a disclosure and not just a gap. Vanilla always answers a login query with
-`null`:
+**Why that was a disclosure and not just a gap.** Vanilla always answers a login query
+with `null`, unconditionally, without ever looking at the channel:
 
 ```java
 // ClientHandshakePacketListenerImpl
@@ -52,11 +50,106 @@ for the queried channel; with no handler it returns false and the vanilla `null`
 So **answering at all — not the contents of the answer — is the disclosure**, and a server
 can probe for a specific mod by sending one login query.
 
-Deliberately not fixed here. Withholding a login answer means choosing what to put in its
-place, and this mod does not fabricate; picking between "stay silent and stall the login",
-"send the vanilla `null` a mod would not have sent", and "answer" is a design decision, not
-a bug fix. Written down rather than papered over. Also stated in the README under "What is
-not covered".
+**Outbound filtering is impossible here, verified.** `javap` on the two payload
+interfaces, side by side, is the whole finding:
+
+```
+net.minecraft.network.protocol.login.custom.CustomQueryPayload            // the QUERY side
+    public abstract net.minecraft.resources.Identifier id();
+    public abstract void write(net.minecraft.network.FriendlyByteBuf);
+
+net.minecraft.network.protocol.login.custom.CustomQueryAnswerPayload      // the ANSWER side
+    public abstract void write(net.minecraft.network.FriendlyByteBuf);
+    // ^ that is the entire interface. There is no id().
+```
+
+`ServerboundCustomQueryAnswerPacket#write` is `writeVarInt(transactionId)` then
+`writeNullable(payload, …)`. No identifier is ever written, so at the
+`Connection#sendPacket` hook the answer is an opaque `(int, maybe-bytes)` pair and no
+channel decision can be made on it. **The decision must be made inbound.**
+
+**And it must produce an answer rather than suppress one.** Cancelling the inbound query
+does not withhold, it stalls. There is no per-transaction accounting anywhere in vanilla —
+no map, set or counter keyed by transaction id on either side — so an unanswered query is
+not refused; a querying server is blocked on that transaction and sends nothing while it
+waits, and after 30 s of receiving nothing the client's own `ReadTimeoutHandler(30)`
+(`Connection.java:438`) fires `disconnect.timeout`. A hang is a behaviour no vanilla client
+exhibits, so it would disclose strictly more than the answer it was meant to avoid.
+
+**What is implemented.** At the same `Connection#channelRead0` `@ModifyVariable(HEAD,
+argsOnly, ordinal = 0)` the bundle filter already uses, a `ClientboundCustomQueryPacket`
+whose channel is withheld is replaced with
+`new ClientboundCustomQueryPacket(txid, new DiscardedQueryPayload(id))`. Fabric's mixin
+tests `packet.payload() instanceof PacketByteBufLoginQueryRequestPayload`, which now fails,
+so its addon is never consulted and vanilla's unconditional `null` answer stands. Nothing
+is cancelled, no packet CmdGuard constructs goes on the wire, and the transaction id is
+preserved. Both constructors are public — `javap`:
+
+```
+public net.minecraft.network.protocol.login.ClientboundCustomQueryPacket(int, CustomQueryPayload)
+    descriptor: (ILnet/minecraft/network/protocol/login/custom/CustomQueryPayload;)V
+public net.minecraft.network.protocol.login.custom.DiscardedQueryPayload(net.minecraft.resources.Identifier)
+    descriptor: (Lnet/minecraft/resources/Identifier;)V
+```
+
+**How the channel id is read, and what that was verified against.** Through the vanilla
+interface method `CustomQueryPayload#id() ()Lnet/minecraft/resources/Identifier;` — no
+Fabric `impl` import is needed for it. Two readings agree:
+
+- `javap -p -s` on the mapped merged jar shows `CustomQueryPayload` declaring `id()`, and
+  `DiscardedQueryPayload` (vanilla's own decode of an unrecognised query, produced by
+  `ClientboundCustomQueryPacket.readUnknownPayload`) implementing it as a record component.
+- The Fabric API 0.141.6 `fabric-networking-api-v1` 5.1.6 sources show
+  `ClientboundCustomQueryPacketMixin` injecting at `HEAD` of `readPayload` with
+  **no condition at all** — `cir.setReturnValue(new PacketByteBufLoginQueryRequestPayload(id,
+  PayloadHelper.read(buf, MAX_PAYLOAD_SIZE)))` — and that type is declared
+  `public record PacketByteBufLoginQueryRequestPayload(Identifier id, FriendlyByteBuf data)
+  implements CustomQueryPayload`.
+
+So with Fabric API installed the payload is *always* a
+`PacketByteBufLoginQueryRequestPayload`, and without it a `DiscardedQueryPayload`; both
+carry the id and both reach it through the same interface method. The read is correct
+either way, and the code depends on the vanilla interface rather than on Fabric's
+replacement staying unconditional.
+
+**Why the null answer is a refusal and not a lie.** The record component is declared
+`@Nullable` and written with `writeNullable`, so `null` is the protocol's own encoding of
+"there is no payload" rather than an invented stand-in. It carries zero identifiers, since
+`CustomQueryAnswerPayload` has no `id()`. It is vanilla's unconditional behaviour, not a
+pose. Fabric's own API treats `null` as the decline value — `ClientLoginNetworkAddon` emits
+`result == null ? null : new PacketByteBufLoginQueryResponse(result)`, i.e. a registered
+handler that completes with `null` produces a byte-identical packet. And it is the same act
+this mod already performs when it omits a channel from `minecraft:register`, moved one
+phase earlier.
+
+**Hazard 1: per-server grants cannot apply, and the wrong remedy makes the mod look
+broken.** `ExposureGuard.beginConnection` runs from `ClientCommonPacketListenerImpl`'s
+constructor, which is first reached at `handleLoginFinished` — *after* every login query.
+So no per-connection snapshot exists while login queries are arriving and
+`ConnectionMixin#cmdguard$snapshot()` necessarily returns `globalsOnlySnapshot()`. The
+remedy for a login broken by this filter is `/cmdguard expose global <namespace>` plus a
+reconnect. **The per-server form cannot help**, and a user told to run it will watch it
+fail and conclude the mod is broken. Do not "fix" this by trying to key the login filter to
+a server; the key does not exist yet.
+
+**Hazard 2: the failure mode is worse here than anywhere else, so it is logged at WARN.**
+Elsewhere a withheld channel means a feature quietly does not work. Here, a server whose
+handshake genuinely needs a real answer refuses the connection — and it surfaces as the
+*server's* disconnect screen with nothing on it pointing at CmdGuard. There is no chat to
+write to and `/cmdguard exposure` is unreachable from a disconnect screen, so `latest.log`
+is the only place the cause can appear. Every substitution logs at WARN, naming the channel
+and the exact remedy command. That is not polish; it is the difference between a
+diagnosable failure and a mystery. The ledger is deliberately *not* written from the login
+path: `beginConnection` resets it at `handleLoginFinished`, so a login entry would be wiped
+before anyone could read it and would be counted against the *previous* connection's tally
+on the way out.
+
+**Hazard 3: none of this has been run in Minecraft.** There is no client on this machine,
+mixin application is launch-time, and a green build proves nothing about any mixin target.
+The spike's "What in-game acceptance would look like" section describes the four-run matrix
+against a rig server that actually sends a login query; until at least its runs (a)-(c)
+have been done, the correct claim is that this builds and matches the decompiled sources —
+nothing stronger.
 
 ### `"required": true` does **not** make the build catch a wrong mixin target
 
@@ -221,6 +314,15 @@ The mixin must test it, because `Connection` is shared by both sides.
 
 **This is where the inbound filter lives**, and the reason is a race, not taste. Verified
 2026-08-29 by the same two readings as the rest of this section.
+
+Three handlers hang off this one method, because one pipeline message is not one packet of
+one type: `cmdguard$dropWithheldInbound` cancels a bare `ClientboundCustomPayloadPacket`,
+`cmdguard$filterBundledPayloads` rebuilds a `ClientboundBundlePacket` without its withheld
+sub-payloads, and `cmdguard$forceVanillaLoginAnswer` substitutes the payload of a
+login-phase `ClientboundCustomQueryPacket` (see "The login phase" under Known hazards).
+All three attach at `HEAD` and their relative order is undefined, which is fine because
+they match mutually disjoint packet types and each returns its argument untouched when it
+does not match.
 
 ```
 protected void channelRead0(ChannelHandlerContext, Packet<?>)
