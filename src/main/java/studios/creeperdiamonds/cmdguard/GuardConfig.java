@@ -49,7 +49,9 @@ public final class GuardConfig {
 
     public ExposureSettings exposure = new ExposureSettings();
 
-    private static GuardConfig instance;
+    // Read from the netty event loop (ConnectionMixin's lazy fallback) as well as the
+    // client thread, so a plain field is not enough to guarantee the write is visible.
+    private static volatile GuardConfig instance;
 
     public static GuardConfig get() {
         if (instance == null) {
