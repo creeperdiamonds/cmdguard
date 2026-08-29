@@ -82,7 +82,7 @@ public final class ConfigScreen extends Screen {
         this.addRenderableWidget(Button.builder(
                 loginLabel(config),
                 button -> {
-                    config.exposure.filterLogin = !config.exposure.loginFilterEnabled();
+                    config.exposure.filterLogin = !config.exposure.filterLogin;
                     config.save();
                     this.rebuildWidgets();
                 }).bounds(centerX - 100, y + 144, 200, 20).build());
@@ -150,7 +150,7 @@ public final class ConfigScreen extends Screen {
      * the login phase runs before a connection has any server identity to key a grant on.
      */
     private static Component loginLabel(GuardConfig config) {
-        String state = config.exposure.loginFilterEnabled() ? "vanilla answer" : "mod may answer";
+        String state = config.exposure.filterLogin ? "vanilla answer" : "mod may answer";
         if (!config.exposureActive()) {
             return Component.literal("Login queries: " + state + " (inactive)");
         }

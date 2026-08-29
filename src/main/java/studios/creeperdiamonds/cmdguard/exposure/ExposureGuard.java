@@ -330,7 +330,7 @@ public final class ExposureGuard {
         return new Snapshot(
                 config.exposureActive() && !SINGLEPLAYER_KEY.equals(serverKey),
                 config.exposure.filterInbound,
-                config.exposure.loginFilterEnabled(),
+                config.exposure.filterLogin,
                 config.exposure.policyFor(serverKey),
                 serverKey);
     }
@@ -365,7 +365,7 @@ public final class ExposureGuard {
                 config.exposure.withheldChannels);
         return new Snapshot(config.exposureActive(),
                 config.exposure.filterInbound,
-                config.exposure.loginFilterEnabled(),
+                config.exposure.filterLogin,
                 policy,
                 null);
     }

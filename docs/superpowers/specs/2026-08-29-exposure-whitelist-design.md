@@ -412,8 +412,15 @@ registration is one the policy also withholds in both directions; `LoginQueryFil
 including that the login decision agrees channel-for-channel with the rest of the layer
 (the same invariant carried into the login phase), that both switches are checked before
 anything can fail, and that a null id, a malformed id and a null policy each withhold; and
-that an `exposure` block written before `filterLogin` existed normalises to login filtering
-**on** rather than off - the migration a primitive `boolean` would have got backwards.
+that an `exposure` block written before `filterLogin` existed loads with login filtering
+**on** rather than off - asserted by parsing that JSON through Gson, not by setting fields
+by hand, because the earlier hand-built tests all agreed with an untested premise (that
+Gson leaves an absent field null) and the premise was false: Gson assigns only the fields
+the JSON names and constructs through the implicit no-arg constructor, so every field
+initializer runs. The same round-trip test is the standing guard for the hazard that is
+real - giving `ExposureSettings` or `GuardConfig` a constructor with arguments deletes that
+implicit constructor, sends Gson down `Unsafe.allocateInstance`, and silently loads every
+primitive in the class as `false`.
 
 Not covered: mixins and Minecraft-facing code. There is no Minecraft client on the build
 machine. This is a real gap, stated rather than papered over.
