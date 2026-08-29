@@ -65,18 +65,51 @@ public final class LoginQueryFilter {
     }
 
     /**
-     * The namespace half of {@code channelId}, for the remedy command in the warning log, or
-     * the whole id when it has no usable namespace.
+     * The command the user should actually run to get this channel answered, ready to be
+     * quoted verbatim in the warning log.
      *
      * <p>The remedy is worth getting exactly right: a user handed the wrong command concludes
      * the mod is broken rather than that they typed the wrong thing, and a broken login is the
      * failure this feature can cause that a user is least equipped to diagnose.
+     *
+     * <p>Which command that is depends on <em>why</em> the channel is withheld, and the
+     * namespace form is not always it. {@link ExposurePolicy#isExposed} consults the
+     * channel-level withhold list before any namespace grant, so for a channel the user
+     * withheld with {@code /cmdguard withhold channel <id>} the namespace form provably
+     * changes nothing -- they would run it, watch it fail, and conclude the mod is broken,
+     * which is the exact outcome this text exists to prevent. For that case the answer is
+     * {@code /cmdguard expose channel <id>}, which also clears the withhold. Otherwise the
+     * channel is withheld because its namespace is not granted, and the namespace form is
+     * correct.
+     *
+     * <p>Both forms are global commands, which is what the login phase requires: it runs
+     * before the connection has a server identity, so per-server grants cannot apply to it.
+     * Channel-level grants and withholds are global by design in any case.
+     */
+    public static String remedyCommand(String channelId, ExposurePolicy policy) {
+        if (policy != null && policy.isWithheldByName(channelId)) {
+            return "/cmdguard expose channel " + channelId;
+        }
+        return "/cmdguard expose global " + remedyNamespace(channelId);
+    }
+
+    /**
+     * The namespace half of {@code channelId}, or a {@code <namespace>} placeholder when it
+     * has no usable one.
+     *
+     * <p>The placeholder rather than the id itself, deliberately: an id with no namespace --
+     * {@code "nocolon"} -- would otherwise be pasted straight into {@code /cmdguard expose
+     * global nocolon}, and a command that cannot parse is worse than an obvious blank, since
+     * the user cannot tell whether they mistyped it or the mod did. Real channel ids always
+     * have a namespace (they are the {@code toString()} of an {@code Identifier} the game
+     * already accepted), so this is the same unreachable-but-total treatment the null case
+     * gets.
      */
     public static String remedyNamespace(String channelId) {
         if (channelId == null) {
             return "<namespace>";
         }
         String namespace = ExposurePolicy.namespaceOf(channelId);
-        return namespace == null ? channelId : namespace;
+        return namespace == null ? "<namespace>" : namespace;
     }
 }

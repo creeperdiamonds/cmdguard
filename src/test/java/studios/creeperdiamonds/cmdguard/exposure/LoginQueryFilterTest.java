@@ -107,11 +107,50 @@ class LoginQueryFilterTest {
     void theRemedyCommandNamesTheNamespaceTheUserMustExpose() {
         assertEquals("somemod", LoginQueryFilter.remedyNamespace("somemod:handshake"));
         assertEquals("somemod", LoginQueryFilter.remedyNamespace("somemod:deep/path"));
+        assertEquals("/cmdguard expose global somemod",
+                LoginQueryFilter.remedyCommand("somemod:handshake", DEFAULTS));
     }
 
+    /**
+     * An id with no namespace must not be pasted into the command, because {@code /cmdguard
+     * expose global nocolon} does not parse -- and a user handed a command that fails cannot
+     * tell whether they mistyped it or the mod did. The placeholder is at least honest about
+     * being a blank to fill in.
+     */
     @Test
     void theRemedyCommandDegradesToSomethingPrintableForAMalformedId() {
         assertEquals("<namespace>", LoginQueryFilter.remedyNamespace(null));
-        assertEquals("nocolon", LoginQueryFilter.remedyNamespace("nocolon"));
+        assertEquals("<namespace>", LoginQueryFilter.remedyNamespace("nocolon"));
+        assertEquals("/cmdguard expose global <namespace>",
+                LoginQueryFilter.remedyCommand("nocolon", DEFAULTS));
+    }
+
+    /**
+     * The remedy has to be one that would actually work. {@code ExposurePolicy.isExposed}
+     * checks the channel-level withhold list before any namespace grant, so for a channel the
+     * user withheld by name the advertised {@code expose global <namespace>} provably changes
+     * nothing: they would run it, watch it fail, and conclude the mod is broken -- which is
+     * the outcome that text exists to prevent.
+     */
+    @Test
+    void theRemedyNamesTheChannelCommandForAChannelWithheldByName() {
+        ExposurePolicy policy = new ExposurePolicy(
+                Set.of("somemod"), Set.of(), Set.of("somemod:handshake"));
+
+        assertTrue(LoginQueryFilter.withholds("somemod:handshake", true, true, policy),
+                "precondition: the namespace is granted and the channel is withheld anyway");
+        assertEquals("/cmdguard expose channel somemod:handshake",
+                LoginQueryFilter.remedyCommand("somemod:handshake", policy));
+        assertEquals("/cmdguard expose global somemod",
+                LoginQueryFilter.remedyCommand("somemod:other", policy),
+                "a sibling channel in the same namespace is not withheld by name");
+    }
+
+    @Test
+    void theRemedyStaysPrintableWithoutAPolicy() {
+        assertEquals("/cmdguard expose global somemod",
+                LoginQueryFilter.remedyCommand("somemod:handshake", null));
+        assertEquals("/cmdguard expose global <namespace>",
+                LoginQueryFilter.remedyCommand(null, null));
     }
 }
