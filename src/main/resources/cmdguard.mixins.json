@@ -6,7 +6,6 @@
   "client": [
     "ClientCommonPacketListenerImplMixin",
     "ClientPacketListenerMixin",
-    "ConnectScreenMixin",
     "ConnectionMixin"
   ],
   "injectors": {

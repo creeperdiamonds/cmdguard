@@ -60,15 +60,29 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
     private volatile ExposureGuard.Snapshot cmdguard$snapshot;
 
     /**
-     * Called once by the connection lifecycle, on the client thread, as soon as the server
-     * key for this connection is known and before any packet can be sent on it. Safe to
-     * never call: {@link #cmdguard$snapshot()} below falls back to a globals-only snapshot
-     * on first use if this was skipped or lost the race with the first packet.
+     * Called by the connection lifecycle as soon as the server key for this connection is
+     * known and before any packet can be sent on it. Safe to never call: {@link
+     * #cmdguard$snapshot()} below falls back to a globals-only snapshot on first use if this
+     * was skipped or lost the race with the first packet.
+     *
+     * <p>Idempotent: installs {@code snapshot} only if none is installed yet, and reports
+     * back via the return value whether it did. This matters because {@code
+     * ClientCommonPacketListenerImpl}'s shared constructor runs more than once against this
+     * same {@code Connection} instance -- once for the configuration-phase listener, again
+     * for the play-phase listener, and a third time on a mid-game reconfigure -- and only
+     * the first of those calls may decide this connection's snapshot. See {@code
+     * ExposureGuard.beginConnection}'s Javadoc for why a second, silently-accepted call here
+     * used to be a real leak (it would replace a real per-server snapshot with a
+     * {@code "singleplayer"} fallback for the rest of the connection's life).
      */
     @Unique
     @Override
-    public void cmdguard$initExposure(String serverKey) {
-        cmdguard$snapshot = ExposureGuard.snapshotFor(serverKey);
+    public boolean cmdguard$initExposure(ExposureGuard.Snapshot snapshot) {
+        if (cmdguard$snapshot != null) {
+            return false;
+        }
+        cmdguard$snapshot = snapshot;
+        return true;
     }
 
     /**
