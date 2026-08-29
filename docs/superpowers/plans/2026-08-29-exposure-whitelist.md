@@ -22,6 +22,7 @@
 - Never withheld regardless of config: `minecraft:brand`, `c:version`, `fabric:registry/sync/complete`.
 - Fail closed: any exception inside the exposure layer withholds. Mixins stay `"required": true` with `defaultRequire: 1`.
 - There is no Minecraft client on this machine. Only pure-Java tests can be run here; everything Minecraft-facing is verified by compilation plus the manual checklist in the spec.
+- **Gradle must be launched on JDK 21 on this machine.** The default `java` on PATH is JDK 17 and the Loom plugin will not load under it. JDK 21 is installed at `C:\Program Files\Eclipse Adoptium\jdk-21.0.12.8-hotspot`; set `JAVA_HOME` and prepend its `bin` to `PATH` for every Gradle invocation. This is deliberately not written into the repo: `org.gradle.java.home` is a machine-specific absolute path that would break CI and every other contributor. The `java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }` block in `build.gradle` pins the compile and test JVM, but does **not** change the JVM the Gradle daemon itself runs on, so it does not remove this requirement.
 
 ---
 
@@ -1084,16 +1085,19 @@ public abstract class ConnectionMixin {
     @Shadow
     public abstract PacketFlow getSending();
 
-    @Inject(method = "send(Lnet/minecraft/network/protocol/Packet;)V",
+    @Inject(method = "sendPacket(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
             at = @At("HEAD"), cancellable = true)
-    private void cmdguard$dropWithheld(Packet<?> packet, CallbackInfo ci) {
+    private void cmdguard$dropWithheld(Packet<?> packet,
+                                       ChannelFutureListener listener,
+                                       boolean flush,
+                                       CallbackInfo ci) {
         if (getSending() == PacketFlow.SERVERBOUND && ExposureGuard.shouldDrop(packet)) {
             ci.cancel();
         }
     }
 
-    @ModifyVariable(method = "send(Lnet/minecraft/network/protocol/Packet;)V",
-            at = @At("HEAD"), argsOnly = true)
+    @ModifyVariable(method = "sendPacket(Lnet/minecraft/network/protocol/Packet;Lio/netty/channel/ChannelFutureListener;Z)V",
+            at = @At("HEAD"), argsOnly = true, ordinal = 0)
     private Packet<?> cmdguard$filterIdentifiers(Packet<?> packet) {
         if (getSending() != PacketFlow.SERVERBOUND) {
             return packet;
@@ -1103,7 +1107,11 @@ public abstract class ConnectionMixin {
 }
 ```
 
-If Task 5 found that the public send methods delegate to a private funnel, target the funnel instead and keep both injectors on it. If there are several public overloads that do not share a funnel, add one pair of injectors per overload — an unhooked overload is an unfiltered path.
+Imports needed: `io.netty.channel.ChannelFutureListener`, `net.minecraft.network.protocol.PacketFlow`.
+
+**Why the private funnel and not a public `send`** (verified in Task 5, recorded in `NOTES.md`): all three public `send` overloads do funnel into `sendPacket`, but `sendPacket` also has a caller that reaches it without any public `send` — the `runOnceConnected` lambda in `initiateServerboundConnection`, which sends the handshake directly. Hooking `send` would leave that path unfiltered. It only carries `ClientIntentionPacket` today, so nothing leaks through it now, but the funnel is provably complete and `send` provably is not.
+
+Do not move the hook down to `doSendPacket`: it sits after the deferred-queue split and may already be on the netty event loop, which is the wrong place to cancel or swap a packet.
 
 - [ ] **Step 4: Register the mixin**
 
@@ -1133,27 +1141,60 @@ git commit -m "feat: withhold non-whitelisted payloads at the connection"
 ### Task 8: Inbound filtering and connection reset
 
 **Files:**
-- Modify: `src/main/java/studios/creeperdiamonds/cmdguard/mixin/ClientPacketListenerMixin.java`
+- Create: `src/main/java/studios/creeperdiamonds/cmdguard/mixin/ClientCommonPacketListenerImplMixin.java`
+- Modify: `src/main/resources/cmdguard.mixins.json`
 - Modify: `src/main/java/studios/creeperdiamonds/cmdguard/CmdGuardClient.java`
 
 **Interfaces:**
 - Consumes: `ExposureGuard.allowInbound`, `ExposureGuard.resetForNewConnection`, and the inbound handler signature recorded in Task 5.
 - Produces: no new public API.
 
-- [ ] **Step 1: Add the inbound injector**
+- [ ] **Step 1: Add the inbound mixin**
 
-In `ClientPacketListenerMixin.java`, add imports for `ClientboundCustomPayloadPacket`, `CallbackInfo` is already present, and `ExposureGuard`. Then append this method, replacing the method name with the one recorded in Task 5:
+Task 5 established that `handleCustomPayload(ClientboundCustomPayloadPacket)` is declared on `ClientCommonPacketListenerImpl`, not on `ClientPacketListener`. `ClientPacketListener` and `ClientConfigurationPacketListenerImpl` both extend it and neither overrides that overload, so one mixin on the base class covers the play *and* configuration phases — which matters, because every Fabric API client-to-server payload is configuration-phase.
+
+Create `src/main/java/studios/creeperdiamonds/cmdguard/mixin/ClientCommonPacketListenerImplMixin.java`:
 
 ```java
-    @Inject(method = "handleCustomPayload", at = @At("HEAD"), cancellable = true)
+package studios.creeperdiamonds.cmdguard.mixin;
+
+import net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
+import org.spongepowered.asm.mixin.Mixin;
+import org.spongepowered.asm.mixin.injection.At;
+import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
+
+/**
+ * Inbound half of the exposure layer: a mod that never receives the probe cannot answer it.
+ *
+ * <p>The full descriptor is mandatory. This class declares two methods named
+ * handleCustomPayload that differ only in parameter type, and a bare method name would bind
+ * the wrong one.
+ *
+ * <p>This runs OFF the client thread. Vanilla returns early for DiscardedPayload before it
+ * calls PacketUtils.ensureRunningOnSameThread, so a HEAD injection precedes the thread
+ * hand-off. Drop only -- no client-world work here.
+ */
+@Mixin(ClientCommonPacketListenerImpl.class)
+public abstract class ClientCommonPacketListenerImplMixin {
+
+    @Inject(method = "handleCustomPayload(Lnet/minecraft/network/protocol/common/ClientboundCustomPayloadPacket;)V",
+            at = @At("HEAD"), cancellable = true)
     private void cmdguard$dropWithheldInbound(ClientboundCustomPayloadPacket packet, CallbackInfo ci) {
         if (!ExposureGuard.allowInbound(packet.payload().type().id())) {
             ci.cancel();
         }
     }
+}
 ```
 
-If Task 5 found this handler is declared on `ClientCommonPacketListenerImpl` rather than `ClientPacketListener`, create `src/main/java/studios/creeperdiamonds/cmdguard/mixin/ClientCommonPacketListenerImplMixin.java` with the same injector and register it in `cmdguard.mixins.json` instead of editing this file.
+Leave `ClientPacketListenerMixin` untouched — the command guard it carries is unrelated.
+
+- [ ] **Step 1b: Register the mixin**
+
+Add `"ClientCommonPacketListenerImplMixin"` to the `client` array in `src/main/resources/cmdguard.mixins.json`, alongside `ClientPacketListenerMixin` and `ConnectionMixin`.
 
 - [ ] **Step 2: Reset the snapshot on each new connection**
 
