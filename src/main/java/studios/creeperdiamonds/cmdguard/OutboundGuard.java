@@ -47,27 +47,19 @@ public final class OutboundGuard {
     private OutboundGuard() {
     }
 
+    /**
+     * The typed-command half, for {@code ClientPacketListenerMixin}.
+     *
+     * <p>The decision itself is {@link CommandFilter#blocks}, which is Minecraft-free and
+     * unit-tested; this only supplies the live config and the client-dispatcher lookup. Same
+     * split as {@link #shouldBlockSuggestion} / {@link SuggestionFilter}, and it is what lets
+     * {@code SuggestionFilterTest} compare the two guards against each other rather than
+     * against a copy of one of them.
+     */
     public static boolean shouldBlock(String command, boolean clicked) {
         GuardConfig config = GuardConfig.get();
-        if (!config.enabled) {
-            return false;
-        }
-
-        String root = rootOf(command);
-        if (root.isEmpty()) {
-            return false;
-        }
-
-        // Owned by a client mod -- it never reaches the network. Never our business.
-        if (isClientCommand(root)) {
-            return false;
-        }
-
-        if (clicked && config.allowClickedCommands) {
-            return false;
-        }
-
-        return !config.allowlist.contains(root);
+        return CommandFilter.blocks(command, clicked, config.enabled,
+                config.allowClickedCommands, config.allowlist, OutboundGuard::isClientCommand);
     }
 
     public static boolean isClientCommand(String root) {

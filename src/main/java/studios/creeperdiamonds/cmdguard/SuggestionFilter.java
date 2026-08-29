@@ -25,18 +25,18 @@ import java.util.Set;
  * a suggestion request is judged by exactly the rule that governs the command it would become.
  * That is the only reading under which the two guards cannot disagree.
  *
- * <p><b>Two deliberate divergences from {@code OutboundGuard#shouldBlock}</b>, both in the
+ * <p><b>Two deliberate divergences from {@link CommandFilter#blocks}</b>, both in the
  * strict direction, both because a suggestion request <em>is</em> traffic where a blocked
  * command is not:
  *
  * <ul>
- *   <li><b>An empty root is withheld, not allowed.</b> {@code OutboundGuard} lets an empty
+ *   <li><b>An empty root is withheld, not allowed.</b> {@code CommandFilter} lets an empty
  *       root through because an empty command runs nothing and sends nothing. Here the text
  *       goes on the wire regardless of whether it parses, so it must be judged -- and an
  *       empty root is by definition not on the allowlist. Nothing is lost: the completion of
  *       a command <em>name</em> is served locally from the client's own command tree (see
  *       the class note on partial roots below).</li>
- *   <li><b>A client-command root is <em>not</em> exempt.</b> {@code OutboundGuard} exempts a
+ *   <li><b>A client-command root is <em>not</em> exempt.</b> {@code CommandFilter} exempts a
  *       root owned by the client dispatcher because such a command never reaches the network.
  *       A suggestion request for it does. {@code NOTES.md}'s leak vector #3 is precisely this:
  *       a client mod that hangs {@code SuggestionProviders.ASK_SERVER} on one of its own
