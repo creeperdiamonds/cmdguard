@@ -322,8 +322,11 @@ class IdentifierFilterTest {
     void filtersSetsAndPreservesIterationOrder() {
         Set<String> input = new LinkedHashSet<>(
                 List.of("fabric:a", "somemod:b", "minecraft:c"));
-        assertEquals(new LinkedHashSet<>(List.of("fabric:a", "minecraft:c")),
-                IdentifierFilter.retain(input, defaults()));
+
+        // Compared as a List on purpose: Set equality ignores order, so asserting against
+        // another Set would pass even if the filter shuffled its output.
+        assertEquals(List.of("fabric:a", "minecraft:c"),
+                List.copyOf(IdentifierFilter.retain(input, defaults())));
     }
 }
 ```
