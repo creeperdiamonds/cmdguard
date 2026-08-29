@@ -61,6 +61,22 @@ public final class ExposurePolicy {
         return namespace != null && exposedNamespaces.contains(namespace);
     }
 
+    /**
+     * True for an id shaped like {@code namespace:path}, both halves non-empty, exactly one
+     * colon -- i.e. something that could actually be a channel and could actually match.
+     *
+     * <p>Used by {@code /cmdguard expose|withhold channel <id>} to refuse a malformed id
+     * rather than storing it. Storing one is worse than a typo: {@link #isExposed} would
+     * never match it, so {@code withhold channel} in particular would silently do nothing
+     * while the user believes the channel is withheld -- a false sense of privacy, which is
+     * the one direction this feature must never fail in.
+     */
+    public static boolean isWellFormedChannelId(String channelId) {
+        return channelId != null
+                && namespaceOf(channelId) != null
+                && channelId.indexOf(':') == channelId.lastIndexOf(':');
+    }
+
     /** Null for anything that is not exactly one non-empty namespace and one non-empty path. */
     static String namespaceOf(String channelId) {
         int colon = channelId.indexOf(':');

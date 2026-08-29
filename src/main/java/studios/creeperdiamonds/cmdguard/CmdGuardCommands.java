@@ -43,10 +43,21 @@ public final class CmdGuardCommands {
                                 .then(ClientCommandManager.argument("namespace", StringArgumentType.word())
                                         .executes(ctx -> expose(ctx,
                                                 StringArgumentType.getString(ctx, "namespace"), true))))
+                        // greedyString, not word: Brigadier's unquoted-word charset excludes
+                        // ':', so word() cannot accept "somemod:handshake" at all. Channel
+                        // ids never contain a space, so greedy costs nothing here.
+                        .then(ClientCommandManager.literal("channel")
+                                .then(ClientCommandManager.argument("channel", StringArgumentType.greedyString())
+                                        .executes(ctx -> exposeChannel(ctx,
+                                                StringArgumentType.getString(ctx, "channel")))))
                         .then(ClientCommandManager.argument("namespace", StringArgumentType.word())
                                 .executes(ctx -> expose(ctx,
                                         StringArgumentType.getString(ctx, "namespace"), false))))
                 .then(ClientCommandManager.literal("withhold")
+                        .then(ClientCommandManager.literal("channel")
+                                .then(ClientCommandManager.argument("channel", StringArgumentType.greedyString())
+                                        .executes(ctx -> withholdChannel(ctx,
+                                                StringArgumentType.getString(ctx, "channel")))))
                         .then(ClientCommandManager.argument("namespace", StringArgumentType.word())
                                 .executes(ctx -> withhold(ctx,
                                         StringArgumentType.getString(ctx, "namespace")))))
@@ -213,6 +224,107 @@ public final class CmdGuardCommands {
                         : value + " was not exposed")
                 .withStyle(removed ? ChatFormatting.YELLOW : ChatFormatting.GRAY));
         return 1;
+    }
+
+    /**
+     * {@code /cmdguard expose channel <id>} -- the channel-level refinement the spec calls
+     * for (design doc line 210), for the case where a namespace grant is too coarse.
+     *
+     * <p>Global, not per-server: {@code exposedChannels} and {@code withheldChannels} are
+     * single global sets in {@code ExposureSettings}, with no per-server variant, and the
+     * feedback says so rather than letting the user assume otherwise.
+     *
+     * <p>Also clears any withhold on the same channel, because {@code ExposurePolicy} gives
+     * a channel withhold precedence over every grant -- leaving it in place would make this
+     * command silently do nothing.
+     */
+    private static int exposeChannel(CommandContext<FabricClientCommandSource> ctx, String channel) {
+        String value = normaliseChannel(ctx, channel);
+        if (value == null) {
+            return 1;
+        }
+        GuardConfig config = GuardConfig.get();
+
+        boolean added = config.exposure.exposedChannels.add(value);
+        boolean unwithheld = config.exposure.withheldChannels.remove(value);
+        config.save();
+
+        feedback(ctx, Component.literal(added || unwithheld
+                        ? "Exposing channel " + value + " everywhere"
+                        : "Channel " + value + " was already exposed")
+                .withStyle(added || unwithheld ? ChatFormatting.GREEN : ChatFormatting.GRAY));
+        if (unwithheld) {
+            feedback(ctx, Component.literal("  (also removed it from the withheld-channel list, "
+                    + "which would otherwise have overridden this)").withStyle(ChatFormatting.GRAY));
+        }
+        feedback(ctx, Component.literal(
+                        "Channel grants are global -- they apply on every server. "
+                                + "Takes effect on your next connection.")
+                .withStyle(ChatFormatting.GRAY));
+        return 1;
+    }
+
+    /**
+     * {@code /cmdguard withhold channel <id>} -- withholds one channel even where its
+     * namespace is exposed. A channel withhold takes precedence over every grant, so this
+     * also drops any explicit channel grant to keep the stored config honest about what is
+     * actually in force.
+     */
+    private static int withholdChannel(CommandContext<FabricClientCommandSource> ctx, String channel) {
+        String value = normaliseChannel(ctx, channel);
+        if (value == null) {
+            return 1;
+        }
+        GuardConfig config = GuardConfig.get();
+
+        boolean added = config.exposure.withheldChannels.add(value);
+        boolean ungranted = config.exposure.exposedChannels.remove(value);
+        config.save();
+
+        if (ExposurePolicy.NEVER_WITHHELD.contains(value)) {
+            feedback(ctx, Component.literal(
+                            "Note: " + value + " is never withheld -- "
+                                    + (value.equals("minecraft:brand")
+                                    ? "the brand string is your client's truthful identification and CmdGuard never alters it."
+                                    : "it carries no mod data and blocking it would only cost you the join.")
+                                    + " This entry will have no effect.")
+                    .withStyle(ChatFormatting.YELLOW));
+        }
+
+        feedback(ctx, Component.literal(added || ungranted
+                        ? "Withholding channel " + value + " everywhere"
+                        : "Channel " + value + " was already withheld")
+                .withStyle(added || ungranted ? ChatFormatting.YELLOW : ChatFormatting.GRAY));
+        if (ungranted) {
+            feedback(ctx, Component.literal("  (also removed its explicit channel grant)")
+                    .withStyle(ChatFormatting.GRAY));
+        }
+        feedback(ctx, Component.literal(
+                        "Channel withholds are global -- they apply on every server, and beat "
+                                + "any namespace grant. Takes effect on your next connection.")
+                .withStyle(ChatFormatting.GRAY));
+        return 1;
+    }
+
+    /**
+     * Lowercases a typed channel id, or reports why it cannot be one and returns null.
+     *
+     * <p>Refusing a malformed id matters most for {@code withhold}: an id that can never
+     * match would be stored, look right in {@code cmdguard.json}, and withhold nothing --
+     * a false sense of privacy, which is the one direction this feature must not fail in.
+     */
+    private static String normaliseChannel(CommandContext<FabricClientCommandSource> ctx, String channel) {
+        String value = channel.trim().toLowerCase(Locale.ROOT);
+        if (!ExposurePolicy.isWellFormedChannelId(value)) {
+            feedback(ctx, Component.literal(
+                            "\"" + channel + "\" is not a channel id. Channels look like "
+                                    + "namespace:path, e.g. somemod:handshake -- run /cmdguard exposure "
+                                    + "or /cmdguard audit to see real ones. "
+                                    + "For a whole namespace, use /cmdguard withhold <namespace>.")
+                    .withStyle(ChatFormatting.RED));
+            return null;
+        }
+        return value;
     }
 
     private static void feedback(CommandContext<FabricClientCommandSource> ctx, Component message) {
