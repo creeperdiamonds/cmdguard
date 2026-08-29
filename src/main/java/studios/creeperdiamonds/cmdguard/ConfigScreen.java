@@ -7,8 +7,9 @@ import net.minecraft.network.chat.Component;
 /**
  * Minimal settings screen reached from Mod Menu. The command allowlist is edited via
  * /cmdguard allow|deny and the exposure whitelist's namespaces via /cmdguard
- * expose|withhold, so this only surfaces the four toggles (guard, clicked-command
- * policy, exposure whitelist, inbound-probe filtering) plus a channel audit button.
+ * expose|withhold, so this only surfaces the five toggles (guard, clicked-command
+ * policy, exposure whitelist, inbound-probe filtering, login-query filtering) plus a
+ * channel audit button.
  *
  * <p>Every toggle rebuilds the whole screen rather than relabelling its own button, because
  * the guard's master switch also gates the exposure layer: the two exposure labels depend on
@@ -71,8 +72,16 @@ public final class ConfigScreen extends Screen {
                 }).bounds(centerX - 100, y + 96, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
+                loginLabel(config),
+                button -> {
+                    config.exposure.filterLogin = !config.exposure.loginFilterEnabled();
+                    config.save();
+                    this.rebuildWidgets();
+                }).bounds(centerX - 100, y + 120, 200, 20).build());
+
+        this.addRenderableWidget(Button.builder(
                 Component.literal("Done"),
-                button -> this.onClose()).bounds(centerX - 100, y + 132, 200, 20).build());
+                button -> this.onClose()).bounds(centerX - 100, y + 156, 200, 20).build());
     }
 
     /**
@@ -101,6 +110,23 @@ public final class ConfigScreen extends Screen {
         }
         return Component.literal("Inbound probes: "
                 + (config.exposure.filterInbound ? "blocked" : "allowed"));
+    }
+
+    /**
+     * The login-phase toggle. Worded as what happens rather than as a switch name, because
+     * this is the one toggle whose "on" state can cost the player a join: a server whose
+     * handshake genuinely needs a mod's answer refuses the connection, and the disconnect
+     * screen comes from the server with nothing on it naming CmdGuard. The WARN line in
+     * {@code latest.log} is where that is diagnosable, and it names the remedy --
+     * {@code /cmdguard expose global <namespace>}, which is the <em>global</em> form because
+     * the login phase runs before a connection has any server identity to key a grant on.
+     */
+    private static Component loginLabel(GuardConfig config) {
+        String state = config.exposure.loginFilterEnabled() ? "vanilla answer" : "mod may answer";
+        if (!config.exposureActive()) {
+            return Component.literal("Login queries: " + state + " (inactive)");
+        }
+        return Component.literal("Login queries: " + state);
     }
 
     @Override

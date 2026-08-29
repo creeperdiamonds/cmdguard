@@ -45,6 +45,48 @@ class ExposureSettingsTest {
         assertTrue(settings.perServerNamespaces.isEmpty());
     }
 
+    /**
+     * The migration that a primitive {@code boolean} would have got wrong. A config written
+     * before {@code filterLogin} existed still has an {@code exposure} block, so {@code
+     * GuardConfig} keeps it rather than replacing it wholesale -- and Gson would have left a
+     * primitive field {@code false}, silently switching login filtering off for every existing
+     * user. Boxed plus this repair is what makes the absent field default to on.
+     */
+    @Test
+    void normaliseTurnsAnAbsentLoginToggleOnRatherThanOff() {
+        ExposureSettings settings = new ExposureSettings();
+        settings.filterLogin = null;
+
+        settings.normalise();
+
+        assertEquals(Boolean.TRUE, settings.filterLogin);
+        assertTrue(settings.loginFilterEnabled());
+    }
+
+    @Test
+    void loginFilterReadsAsOnWhenTheFieldWasNeverRepaired() {
+        ExposureSettings settings = new ExposureSettings();
+        settings.filterLogin = null;
+
+        assertTrue(settings.loginFilterEnabled(),
+                "an unmigrated or hand-edited null must never read as 'filtering off'");
+    }
+
+    @Test
+    void normaliseKeepsADeliberateLoginOptOut() {
+        ExposureSettings settings = new ExposureSettings();
+        settings.filterLogin = Boolean.FALSE;
+
+        settings.normalise();
+
+        assertFalse(settings.loginFilterEnabled(), "an explicit false is a choice, not a gap");
+    }
+
+    @Test
+    void freshSettingsFilterLoginQueries() {
+        assertTrue(new ExposureSettings().loginFilterEnabled());
+    }
+
     @Test
     void normaliseKeepsADeliberatelyEmptiedNamespaceSet() {
         ExposureSettings settings = new ExposureSettings();

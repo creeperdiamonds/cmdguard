@@ -7,6 +7,7 @@ import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
 import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.game.ClientboundBundlePacket;
+import net.minecraft.network.protocol.login.ClientboundCustomQueryPacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -61,6 +62,12 @@ import java.util.concurrent.atomic.AtomicReference;
  * but touches no inbound handler method, so there is nothing here to race with. This is the
  * same argument that put the outbound filter on {@code sendPacket} rather than on a public
  * {@code send} overload.
+ *
+ * <p><b>Three inbound handlers, not one</b>, because "one pipeline message" is not "one
+ * packet of one type": a bare {@code ClientboundCustomPayloadPacket} is cancelled, a
+ * {@code ClientboundBundlePacket} is rebuilt without its withheld sub-payloads, and a
+ * login-phase {@code ClientboundCustomQueryPacket} has its payload substituted so that
+ * vanilla, rather than a mod, answers it. See each handler's own Javadoc.
  *
  * <p><b>Per-connection snapshot.</b> {@code sendPacket} provably runs on two threads (the
  * client thread via {@code ClientCommonPacketListenerImpl#send}, and the netty event loop
@@ -283,5 +290,61 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
             return packet;
         }
         return ExposureGuard.filterBundle(bundle, cmdguard$snapshot());
+    }
+
+    /**
+     * The third half of the inbound choke point: the login phase, which is neither a custom
+     * payload nor a bundle.
+     *
+     * <p>A login query arrives as a {@code ClientboundCustomQueryPacket} -- a different packet
+     * type from {@code ClientboundCustomPayloadPacket}, so neither handler above matches it,
+     * which is why the login phase was uncovered until now. It is also never bundled: {@code
+     * ProtocolInfoBuilder#withBundlePacket} has exactly one caller in the whole game
+     * ({@code GameProtocols}, play clientbound) and {@code ProtocolInfo#bundlerInfo()} is
+     * {@code @Nullable}, so the login protocol installs no {@code "bundler"} handler at all
+     * and a login query is always its own top-level pipeline message. Verified 2026-08-29
+     * over the full decompiled 1.21.11 extract; see {@code NOTES.md}, "The login phase".
+     *
+     * <p><b>A substitution, not a cancel, and this is the load-bearing decision.</b>
+     * Cancelling here would not withhold, it would stall: vanilla keeps no per-transaction
+     * accounting on either side, so a querying server -- which is blocked on that transaction
+     * and therefore sends nothing while it waits -- leaves the client receiving nothing until
+     * {@code Connection}'s own {@code ReadTimeoutHandler(30)} fires {@code disconnect.timeout}.
+     * A hang is a behaviour no vanilla client exhibits, so it would disclose more than the
+     * answer it was meant to avoid. Replacing the payload with a {@code DiscardedQueryPayload}
+     * instead makes Fabric API's {@code ClientHandshakePacketListenerImplMixin} -- which only
+     * intercepts a {@code PacketByteBufLoginQueryRequestPayload} -- skip the packet, leaving
+     * unmodified vanilla {@code handleCustomQuery} to send its unconditional
+     * {@code (transactionId, null)} answer. See {@link ExposureGuard#forceVanillaLoginAnswer}
+     * for the full argument and the {@code javap} verification, and
+     * {@code .superpowers/sdd/login-phase-spike.md} for the investigation.
+     *
+     * <p>Unlike the play-phase mixin-ordering hazard that moved the inbound filter here in the
+     * first place, this does not race Fabric's mixin: the substitution happens in {@code
+     * channelRead0}, before {@code genericsFtw} dispatches to the listener at all, so Fabric's
+     * injection inside {@code handleCustomQuery} is downstream by construction rather than by
+     * priority. Fabric API's own {@code ConnectionMixin} still touches no inbound handler.
+     *
+     * <p>This and the two handlers above all attach at {@code HEAD} and their relative order is
+     * undefined, which is again fine because all three match mutually disjoint packet types: a
+     * {@code ClientboundCustomQueryPacket} is neither a {@code ClientboundBundlePacket} nor a
+     * {@code ClientboundCustomPayloadPacket}, and each returns its argument untouched when it
+     * does not match.
+     *
+     * <p><b>The snapshot here is always the globals-only one, necessarily.</b> {@code
+     * ExposureGuard.beginConnection} runs from {@code ClientCommonPacketListenerImpl}'s
+     * constructor, first reached at {@code handleLoginFinished} -- after the login phase. So
+     * {@link #cmdguard$snapshot()} returns {@link ExposureGuard#globalsOnlySnapshot()} for
+     * every login query, and per-server grants cannot apply. That is documented in the WARN
+     * line this emits, which names {@code /cmdguard expose global <namespace>} as the remedy.
+     */
+    @ModifyVariable(method = "channelRead0(Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;)V",
+            at = @At("HEAD"), argsOnly = true, ordinal = 0)
+    private Packet<?> cmdguard$forceVanillaLoginAnswer(Packet<?> packet) {
+        if (getReceiving() != PacketFlow.CLIENTBOUND
+                || !(packet instanceof ClientboundCustomQueryPacket query)) {
+            return packet;
+        }
+        return ExposureGuard.forceVanillaLoginAnswer(query, cmdguard$snapshot());
     }
 }

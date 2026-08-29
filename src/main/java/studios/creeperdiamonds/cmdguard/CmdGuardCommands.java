@@ -121,6 +121,8 @@ public final class CmdGuardCommands {
         }
         return "inbound probes "
                 + (config.exposure.filterInbound ? "blocked" : "allowed")
+                + ", login queries "
+                + (config.exposure.loginFilterEnabled() ? "answered by vanilla" : "answerable by mods")
                 + ", " + config.exposure.exposedNamespaces.size() + " namespaces exposed";
     }
 

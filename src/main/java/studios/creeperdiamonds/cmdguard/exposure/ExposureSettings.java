@@ -17,6 +17,29 @@ public final class ExposureSettings {
     /** Drop inbound payloads on withheld channels, so a mod never sees the probe. */
     public boolean filterInbound = true;
 
+    /**
+     * Force vanilla's empty login-query answer for withheld channels, so a mod with a
+     * {@code ClientLoginNetworking} handler cannot answer a login probe and thereby disclose
+     * itself. See {@code ConnectionMixin#cmdguard$forceVanillaLoginAnswer}.
+     *
+     * <p><b>Boxed on purpose, unlike {@link #filterInbound}.</b> Gson leaves an absent field
+     * null, and a {@code boolean} field would take that null as {@code false} -- silently
+     * switching this off for every user whose {@code cmdguard.json} was written before this
+     * field existed, which is a fail-<em>open</em> migration and exactly the direction this
+     * layer must never fail in. {@link #filterInbound} does not need the same treatment
+     * because it shipped with the whole {@code exposure} object: a config predating it has no
+     * {@code exposure} block at all, so {@code GuardConfig} replaces the whole thing with a
+     * fresh, correctly-defaulted instance. A config predating <em>this</em> field does have an
+     * {@code exposure} block, so only {@link #normalise()} can repair it. Read it through
+     * {@link #loginFilterEnabled()} rather than unboxing the field.
+     */
+    public Boolean filterLogin = Boolean.TRUE;
+
+    /** {@link #filterLogin}, with a null (unmigrated or hand-edited) value read as on. */
+    public boolean loginFilterEnabled() {
+        return filterLogin == null || filterLogin;
+    }
+
     public Set<String> exposedNamespaces = new LinkedHashSet<>(ExposurePolicy.DEFAULT_NAMESPACES);
     public Set<String> exposedChannels = new LinkedHashSet<>();
     public Set<String> withheldChannels = new LinkedHashSet<>();
@@ -39,6 +62,9 @@ public final class ExposureSettings {
      * null; an empty set, by contrast, is a deliberate strict-mode choice and is kept.
      */
     public void normalise() {
+        if (filterLogin == null) {
+            filterLogin = Boolean.TRUE;
+        }
         if (exposedNamespaces == null) {
             exposedNamespaces = new LinkedHashSet<>(ExposurePolicy.DEFAULT_NAMESPACES);
         }
