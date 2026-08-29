@@ -15,15 +15,17 @@ import java.util.TreeMap;
 import java.util.Map;
 
 /**
- * Transparency, not concealment.
+ * The readout of the exposure layer.
  *
- * <p>A server cannot read your mods folder and Fabric Loader never sends a mod list.
- * What a server CAN do is ask on a custom channel -- and a mod you installed may answer,
- * because FabricLoader#getAllMods is public API. This names the mods on your machine
- * capable of receiving such a request, so the choice to keep or remove them is yours.
+ * <p>A server cannot read your mods folder and Fabric Loader never sends a mod list. What
+ * a server CAN do is ask on a custom channel, or simply read the channel list your client
+ * advertises -- and either names your mods. This lists the channels involved and what
+ * CmdGuard decided about each.
  *
- * <p>It deliberately does not suppress any reply. Silently withholding an answer while
- * staying connected deceives the operator; removing the mod, or not joining, does not.
+ * <p>CmdGuard withholds what is not on the exposure whitelist and never fabricates. It
+ * does not claim to be vanilla, does not alter minecraft:brand, and never advertises a
+ * channel or identifier the client does not actually have. Declining to answer is a
+ * refusal; inventing an answer would be a lie, and this mod does not do the second.
  */
 public final class ChannelAudit {
     private ChannelAudit() {

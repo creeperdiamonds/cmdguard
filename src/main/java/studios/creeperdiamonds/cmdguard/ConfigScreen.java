@@ -47,8 +47,27 @@ public final class ConfigScreen extends Screen {
                 }).bounds(centerX - 100, y + 48, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
+                Component.literal("Exposure whitelist: " + (config.exposure.enabled ? "ON" : "OFF")),
+                button -> {
+                    config.exposure.enabled = !config.exposure.enabled;
+                    config.save();
+                    button.setMessage(Component.literal("Exposure whitelist: "
+                            + (config.exposure.enabled ? "ON" : "OFF")));
+                }).bounds(centerX - 100, y + 72, 200, 20).build());
+
+        this.addRenderableWidget(Button.builder(
+                Component.literal("Inbound probes: "
+                        + (config.exposure.filterInbound ? "blocked" : "allowed")),
+                button -> {
+                    config.exposure.filterInbound = !config.exposure.filterInbound;
+                    config.save();
+                    button.setMessage(Component.literal("Inbound probes: "
+                            + (config.exposure.filterInbound ? "blocked" : "allowed")));
+                }).bounds(centerX - 100, y + 96, 200, 20).build());
+
+        this.addRenderableWidget(Button.builder(
                 Component.literal("Done"),
-                button -> this.onClose()).bounds(centerX - 100, y + 84, 200, 20).build());
+                button -> this.onClose()).bounds(centerX - 100, y + 132, 200, 20).build());
     }
 
     @Override

@@ -1,11 +1,13 @@
 # CmdGuard
 
 A **client-side** Fabric mod for Minecraft **1.21.11**. It does one honest thing:
-it stops commands you didn't allow from leaving your machine, and it shows you which
-of your installed mods a server can talk to.
+it stops commands you didn't allow from leaving your machine, and it controls which
+client metadata reaches a server in the first place.
 
-It does **not** spoof your client, hide your mod list, or lie to a server. See
-[What this does and doesn't do](#what-this-does-and-doesnt-do).
+It does **not** spoof your client, does not alter `minecraft:brand`, and never
+advertises a channel or identifier the client does not actually have. See
+[What this does and doesn't do](#what-this-does-and-doesnt-do) and
+[Exposure whitelist](#exposure-whitelist).
 
 ## Features
 
@@ -23,6 +25,10 @@ It does **not** spoof your client, hide your mod list, or lie to a server. See
 - **Channel audit.** `/cmdguard audit` lists every installed mod that has registered a
   networking channel — i.e. every mod a server could ask something of. This is the real,
   checkable version of "what can a server see about me."
+- **Exposure whitelist.** Enforces what the channel audit only reports: outbound and
+  inbound traffic on channels outside the default namespace set is withheld unless you
+  allow it. `/cmdguard exposure` shows the readout. See
+  [Exposure whitelist](#exposure-whitelist) below.
 
 ## Commands
 
@@ -34,8 +40,13 @@ It does **not** spoof your client, hide your mod list, or lie to a server. See
 | `/cmdguard list` | Show the allowlist |
 | `/cmdguard audit` | List mods reachable over server channels |
 | `/cmdguard clear` | Empty the allowlist (strict mode) |
+| `/cmdguard exposure` | List channels observed this connection and their EXPOSED/WITHHELD state |
+| `/cmdguard expose <namespace>` | Allow a namespace for the current server; add `global` before the namespace to allow it everywhere |
+| `/cmdguard withhold <namespace>` | Withhold a previously-exposed namespace |
 
-Config lives at `config/cmdguard.json`. A settings screen is available via Mod Menu.
+Config lives at `config/cmdguard.json`. A settings screen is available via Mod Menu,
+with toggles for the guard, clicked-command policy, the exposure whitelist, and
+whether inbound probes on withheld channels are blocked.
 
 ## What this does and doesn't do
 
@@ -45,19 +56,59 @@ What a server *can* do:
 - read the client brand string (`fabric`) — a loader constant, not a mod list;
 - see channel registrations announced when a mod uses custom networking;
 - **ask on a custom channel, and have one of your installed mods answer** — because
-  `FabricLoader.getInstance().getAllMods()` is public API and any mod can report it.
+  `FabricLoader.getInstance().getAllMods()` is public API and any mod can report it;
+- read the channel list your client advertises on join, which by itself can name a mod.
 
-That last one is real: a mod in a modpack could report your whole load-out without you
-noticing. CmdGuard's answer is **transparency, not concealment** — `/cmdguard audit`
-names the mods that can be probed, so *you* decide whether to keep them or not join.
+That's real: a mod in a modpack could report your whole load-out without you noticing,
+and the raw channel-advertisement list can do the same even with no mod cooperating.
+CmdGuard's answer is enforcement, not just a report: the [exposure whitelist](#exposure-whitelist)
+withholds both, by default, for anything outside a small generic namespace set — and
+`/cmdguard audit` and `/cmdguard exposure` let you see what is and isn't withheld.
 
-CmdGuard deliberately does **not** silently suppress such a reply while you stay
-connected. Withholding an answer to keep server access is deception; removing the mod,
-or not joining, is not. It also does not alter the brand string or hide anything from a
-server — it can't get you flagged for something it isn't doing, because it adds no
-networking channels and sends no packets of its own.
+CmdGuard never fabricates. It does not alter the brand string, does not claim to be
+vanilla, and never advertises a channel or identifier the client does not actually have.
+Declining to answer is a refusal; inventing an answer would be a lie, and this mod does
+not do the second.
 
 See [NOTES.md](NOTES.md) for the developer-facing hazard table.
+
+## Exposure whitelist
+
+By default, CmdGuard withholds every channel outside the `fabric`, `minecraft`, and `c`
+namespaces, in both directions — outbound (what your client advertises or sends) and
+inbound (what a server sends you on that channel). This includes the identifier lists
+carried inside three of Fabric API's own payloads: the accepted-attachments,
+recipe-serializer, and custom-ingredient sync messages, each of which otherwise names
+every third-party mod that registered one. Everything outside those three namespaces is
+withheld until you explicitly allow it.
+
+**What is *not* hidden.** `minecraft:brand` still reads `fabric`. Fabric API's own
+channels are still advertised and still function. A server can still tell you are
+modded, and roughly which Fabric API version you're on. This reduces mod-inventory
+disclosure; it does not make you look unmodded, and CmdGuard never claims otherwise.
+
+**Withholding has a cost.** A channel you withhold is one the server will not sync to
+you, so withholding degrades the mod that owns it — it doesn't ask, so it doesn't get an
+answer, and it can't send you data over a channel you never advertised. A server that
+*requires* a client mod you are withholding will kick you for not having it. The fix is
+`/cmdguard expose <namespace>` followed by a reconnect — grants are frozen for the
+lifetime of an open connection, so `/cmdguard expose` takes effect on your *next*
+connection, not the one you're on.
+
+**Grants are per server address**, keyed on the address you connected to, plus
+`/cmdguard expose global <namespace>` to allow a namespace everywhere instead of just
+the current server. A few cases don't get a per-server grant:
+
+- **Singleplayer** has no server address, so only global grants apply there. That's
+  definitional, not a limitation — there is no per-server identity to key a grant to.
+- **A server transfer** (the vanilla feature that hands you from one server to another
+  mid-session) deliberately falls back to global grants only, rather than carrying the
+  origin server's per-server grants over to the destination. This is stricter than it
+  has to be, on purpose: the destination is a different server and gets no grant it
+  wasn't given directly.
+- **Realms and quick-play joins are fully covered** — both carry a real server identity
+  through to the connection, so per-server grants apply to them exactly as they do to a
+  normal multiplayer join. They are not exceptions.
 
 ## Building
 
