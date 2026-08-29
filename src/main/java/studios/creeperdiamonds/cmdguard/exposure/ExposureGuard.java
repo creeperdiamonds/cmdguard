@@ -183,9 +183,16 @@ public final class ExposureGuard {
      * once against the same {@code Connection} (see {@link ConnectionInit#cmdguard$initExposure}),
      * potentially called two or three times for what is really one connection. Touches no
      * {@code Minecraft} state at all -- only {@link #NEXT_CONNECTION_IS_TRANSFER} (a plain
-     * {@code AtomicBoolean} this class owns) and the {@link ChannelLedger} -- so it is safe
-     * to call from wherever the caller's constructor happens to run, client thread or netty
-     * event loop.
+     * {@code AtomicBoolean} this class owns), the {@link ChannelLedger}, and the logger --
+     * so it is safe to call from wherever the caller's constructor happens to run, client
+     * thread or netty event loop.
+     *
+     * <p>The winning call also logs two lines: the outgoing connection's tally, emitted
+     * before the ledger is reset (see {@link #logPreviousConnectionSummary()}), and a line
+     * naming the new connection's key and whether filtering is on at all. That second line
+     * is deliberate observability: without it, a filter that is switched off, a filter that
+     * silently failed to install, and a genuinely quiet session all look identical in the
+     * log -- which is precisely how the inbound filter's mixin-ordering defect survived.
      *
      * <p>Idempotent per connection, and this is now a hard guarantee rather than an
      * ordering assumption: {@link ConnectionInit#cmdguard$initExposure} installs via a
@@ -229,11 +236,36 @@ public final class ExposureGuard {
         boolean isTransfer = NEXT_CONNECTION_IS_TRANSFER.get();
         Snapshot snapshot = isTransfer ? globalsOnlySnapshot() : snapshotFor(serverKey);
         if (init.cmdguard$initExposure(snapshot)) {
+            logPreviousConnectionSummary();
             LEDGER.reset();
+            CmdGuardClient.LOGGER.info(
+                    "[cmdguard] exposure filter armed for {}: filtering={}, inbound filtering={}",
+                    describeKey(snapshot.serverKey()), snapshot.active(), snapshot.filterInbound());
             if (isTransfer) {
                 NEXT_CONNECTION_IS_TRANSFER.compareAndSet(true, false);
             }
         }
+    }
+
+    /**
+     * The previous connection's tally, logged <em>before</em> {@link ChannelLedger#reset()}
+     * wipes it.
+     *
+     * <p>{@code /cmdguard exposure} needs an active connection to run, so it is unreachable
+     * from the disconnect screen -- and the ledger is reset the moment the next connection
+     * installs its snapshot. Without this line, a player kicked for withholding a required
+     * mod has no way at all to read what was withheld: the chat is gone, the command is
+     * unreachable, and reconnecting destroys the record. This puts it in {@code latest.log},
+     * which outlives all three.
+     */
+    private static void logPreviousConnectionSummary() {
+        ChannelLedger.Counts counts = LEDGER.counts();
+        if (counts.isEmpty()) {
+            return;
+        }
+        CmdGuardClient.LOGGER.info(
+                "[cmdguard] previous connection: exposed={} withheld={} ({} payloads withheld in total)",
+                counts.exposed(), counts.withheld(), counts.withheldPayloads());
     }
 
     /** Builds the full per-connection snapshot, including this server's own grants. */
@@ -285,7 +317,9 @@ public final class ExposureGuard {
         try {
             String channel = channelOf(custom);
             boolean exposed = snapshot.policy().isExposed(channel);
-            LEDGER.record(channel, exposed);
+            if (LEDGER.record(channel, exposed)) {
+                logFirstWithhold("outbound", channel, snapshot);
+            }
             return !exposed;
         } catch (RuntimeException e) {
             CmdGuardClient.LOGGER.error("[cmdguard] exposure check failed, withholding", e);
@@ -355,8 +389,8 @@ public final class ExposureGuard {
         try {
             String id = channel.toString();
             boolean exposed = snapshot.policy().isExposed(id);
-            if (!exposed) {
-                LEDGER.record(id, false);
+            if (!exposed && LEDGER.record(id, false)) {
+                logFirstWithhold("inbound", id, snapshot);
             }
             return exposed;
         } catch (RuntimeException e) {
@@ -367,5 +401,32 @@ public final class ExposureGuard {
 
     private static String channelOf(ServerboundCustomPayloadPacket packet) {
         return packet.payload().type().id().toString();
+    }
+
+    /**
+     * One INFO line the first time a channel is withheld on a connection, in each direction.
+     *
+     * <p>Nothing about a withheld payload used to be logged anywhere, which made a working
+     * filter and a filter that never ran indistinguishable from the outside -- the exact
+     * condition under which the inbound filter's mixin-ordering defect went unnoticed. It
+     * also matters for the user-facing case the spec calls out: the most common way anyone
+     * meets this feature is being kicked by a server that required a mod they withheld, and
+     * a kick leaves no chat to write to. {@code latest.log} is the one surface that survives
+     * it.
+     *
+     * <p>Once per channel per direction, not once per payload: a chatty channel would
+     * otherwise flood the log, and the repeat count is already in the ledger and in
+     * {@code /cmdguard exposure}.
+     */
+    private static void logFirstWithhold(String direction, String channel, Snapshot snapshot) {
+        CmdGuardClient.LOGGER.info(
+                "[cmdguard] withheld {} payload on channel {} ({}); repeats are counted, not logged."
+                        + " Run /cmdguard exposure for the full readout.",
+                direction, channel, describeKey(snapshot.serverKey()));
+    }
+
+    /** How a snapshot's server key reads in a log line; {@code null} means no per-server identity. */
+    private static String describeKey(String serverKey) {
+        return serverKey == null ? "no per-server identity" : "server " + serverKey;
     }
 }
