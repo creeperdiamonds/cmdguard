@@ -101,6 +101,23 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
     public abstract PacketFlow getReceiving();
 
     /**
+     * True when this connection's netty channel is an in-process one -- i.e. the client
+     * talking to its own integrated server.
+     *
+     * <p>Verified 2026-08-29 with {@code javap} against the mapped 1.21.11 merged jar: the
+     * method is {@code public boolean isMemoryConnection()} and its body is exactly {@code
+     * this.channel instanceof LocalChannel || this.channel instanceof LocalServerChannel}.
+     * {@code Connection#connectToLocalServer} bootstraps through {@code
+     * EventLoopGroupHolder.local()}, whose channel class is {@code LocalChannel} (also read
+     * off the bytecode), so a local world's connection is exactly the set this returns true
+     * for. A real socket connection -- including <em>joining</em> someone else's LAN game --
+     * goes through {@code connectToServer} and a {@code NioSocketChannel}, so it returns
+     * false. See {@link #cmdguard$forceVanillaLoginAnswer}.
+     */
+    @Shadow
+    public abstract boolean isMemoryConnection();
+
+    /**
      * The real, per-server decision surface for this connection, once installed. Written
      * ONLY by {@link #cmdguard$initExposure} via {@link AtomicReference#compareAndSet}, and
      * only ever transitions {@code null -> non-null}, exactly once, for the lifetime of this
@@ -407,12 +424,37 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
      * {@link #cmdguard$snapshot()} returns {@link ExposureGuard#globalsOnlySnapshot()} for
      * every login query, and per-server grants cannot apply. That is documented in the WARN
      * line this emits, which names {@code /cmdguard expose global <namespace>} as the remedy.
+     *
+     * <p><b>Singleplayer is exempt here, and the exemption has to live in this method.</b>
+     * {@code ExposureGuard.snapshotFor} switches {@code active} off for {@link
+     * ExposureGuard#SINGLEPLAYER_KEY} -- a local world's connection runs between the client
+     * and the integrated server in the same JVM, so there is no remote party and nothing to
+     * withhold from. But the login phase necessarily runs on {@link
+     * ExposureGuard#globalsOnlySnapshot()} (see the paragraph above), whose {@code active} is
+     * plain {@code exposureActive()} with no singleplayer exemption in it -- and singleplayer
+     * does run a full handshake through this very method, since {@code
+     * Connection#connectToLocalServer} builds an ordinary {@code Connection} and the
+     * integrated server runs the real login protocol over it. Without this check, a
+     * server-side mod using {@code ServerLoginConnectionEvents.QUERY_START} on the
+     * <em>integrated</em> server would have its own query withheld from the same process, for
+     * zero privacy benefit -- and if that handshake is load-bearing, the local world fails to
+     * load, with a WARN telling the player to expose a namespace to themselves.
+     *
+     * <p>{@link #isMemoryConnection()} is the right test and not merely a convenient one: it
+     * is true for exactly the in-process channel, so a LAN <em>host</em> (which is still this
+     * same integrated-server connection) is exempt and a LAN <em>join</em> (a real socket to
+     * another machine) stays filtered -- matching the per-server behaviour {@code
+     * snapshotFor} documents and the README describes. It also cannot throw or NPE: {@code
+     * Connection#channel} is assigned in {@code channelActive}, which fires before any read,
+     * and a null channel would fail the two {@code instanceof} tests and return false, i.e.
+     * keep filtering on.
      */
     @ModifyVariable(method = "channelRead0(Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;)V",
             at = @At("HEAD"), argsOnly = true, ordinal = 0)
     private Packet<?> cmdguard$forceVanillaLoginAnswer(Packet<?> packet) {
         if (getReceiving() != PacketFlow.CLIENTBOUND
-                || !(packet instanceof ClientboundCustomQueryPacket query)) {
+                || !(packet instanceof ClientboundCustomQueryPacket query)
+                || isMemoryConnection()) {
             return packet;
         }
         return ExposureGuard.forceVanillaLoginAnswer(query, cmdguard$snapshot());
