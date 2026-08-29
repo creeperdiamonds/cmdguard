@@ -1143,11 +1143,27 @@ git commit -m "feat: withhold non-whitelisted payloads at the connection"
 **Files:**
 - Create: `src/main/java/studios/creeperdiamonds/cmdguard/mixin/ClientCommonPacketListenerImplMixin.java`
 - Modify: `src/main/resources/cmdguard.mixins.json`
-- Modify: `src/main/java/studios/creeperdiamonds/cmdguard/CmdGuardClient.java`
+- Modify: `src/main/java/studios/creeperdiamonds/cmdguard/exposure/ExposureGuard.java` (add the snapshot accessor to `ConnectionInit`)
+- Modify: `src/main/java/studios/creeperdiamonds/cmdguard/mixin/ConnectionMixin.java` (make `cmdguard$snapshot()` public)
 
 **Interfaces:**
 - Consumes: `ExposureGuard.allowInbound`, `ExposureGuard.resetForNewConnection`, and the inbound handler signature recorded in Task 5.
 - Produces: no new public API.
+
+- [ ] **Step 0: Expose the snapshot on the `ConnectionInit` interface**
+
+Task 7's fix moved the exposure snapshot to a `@Unique` field on `ConnectionMixin`, reachable only through `ExposureGuard.ConnectionInit`. That interface currently declares only the initialiser, and `ConnectionMixin#cmdguard$snapshot()` is private — so the inbound mixin has no way to read the decision surface for its own connection.
+
+Add to `ExposureGuard.ConnectionInit`:
+
+```java
+        /** The snapshot frozen for this connection, never null -- globals-only if uninitialised. */
+        Snapshot cmdguard$snapshot();
+```
+
+and in `ConnectionMixin`, change `cmdguard$snapshot()` from `private` to `public` and mark it `@Override`.
+
+Do **not** have the inbound path call `ExposureGuard.snapshotFor(currentServerKey())` instead. The inbound handler runs off the client thread, so that would reintroduce exactly the off-thread `Minecraft.getCurrentServer()` read that Task 7's fix removed.
 
 - [ ] **Step 1: Add the inbound mixin**
 
@@ -1180,15 +1196,24 @@ import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
 @Mixin(ClientCommonPacketListenerImpl.class)
 public abstract class ClientCommonPacketListenerImplMixin {
 
+    @Shadow
+    @Final
+    protected Connection connection;
+
     @Inject(method = "handleCustomPayload(Lnet/minecraft/network/protocol/common/ClientboundCustomPayloadPacket;)V",
             at = @At("HEAD"), cancellable = true)
     private void cmdguard$dropWithheldInbound(ClientboundCustomPayloadPacket packet, CallbackInfo ci) {
-        if (!ExposureGuard.allowInbound(packet.payload().type().id())) {
+        ExposureGuard.Snapshot snapshot =
+                ((ExposureGuard.ConnectionInit) (Object) this.connection).cmdguard$snapshot();
+
+        if (!ExposureGuard.allowInbound(packet.payload().type().id(), snapshot)) {
             ci.cancel();
         }
     }
 }
 ```
+
+Confirm the `connection` field's exact name and modifiers against the decompiled `ClientCommonPacketListenerImpl` before relying on the `@Shadow`. Task 5 recorded that this class's `send(Packet)` body is `{ this.connection.send(packet); }`, so the field exists; the name and access are what needs checking.
 
 Leave `ClientPacketListenerMixin` untouched — the command guard it carries is unrelated.
 
@@ -1198,22 +1223,24 @@ Add `"ClientCommonPacketListenerImplMixin"` to the `client` array in `src/main/r
 
 - [ ] **Step 2: Reset the snapshot on each new connection**
 
-In `CmdGuardClient.java`, add the imports:
+`ExposureGuard.resetForNewConnection()` no longer exists — Task 7's fix replaced it with `beginConnection(Connection, String)`, which must be called **on the client thread** once the server key is known.
+
+Fabric's `ClientConfigurationConnectionEvents.INIT` is not usable for this: it hands you the packet listener, not its `Connection`, and `ClientCommonPacketListenerImpl#connection` is not public API. Since this task already mixes into that class, initialise from its constructor instead — the base-class constructor runs for both the configuration and play listeners, so one injection covers both phases.
+
+Add to `ClientCommonPacketListenerImplMixin`:
 
 ```java
-import net.fabricmc.fabric.api.client.networking.v1.ClientConfigurationConnectionEvents;
-import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
+    @Inject(method = "<init>", at = @At("TAIL"))
+    private void cmdguard$beginExposure(CallbackInfo ci) {
+        ExposureGuard.beginConnection(this.connection, ExposureGuard.currentServerKey());
+    }
 ```
 
-and register the reset inside `onInitializeClient()`, after the existing `C2SPlayChannelEvents` registration:
+**Verify before relying on this:** confirm from the decompiled source that `ClientCommonPacketListenerImpl`'s constructor runs on the client thread, not on the netty event loop. The whole point of `beginConnection` taking the server key as a parameter is that `Minecraft.getCurrentServer()` is read on the client thread; calling it from the netty loop would reintroduce the defect Task 7's fix removed. If the constructor is not client-thread, **stop and report** rather than wiring it — the correct hook is then elsewhere, and that is a design decision, not an implementation detail.
 
-```java
-        // A connection gets one policy snapshot for its whole lifetime, so a config edit
-        // mid-session cannot filter the configuration phase under one policy and the play
-        // phase under another.
-        ClientConfigurationConnectionEvents.INIT.register((handler, client) ->
-                ExposureGuard.resetForNewConnection());
-```
+Confirm the constructor's exact descriptor too; `<init>` with no descriptor binds ambiguously if there is more than one constructor.
+
+`CmdGuardClient.java` needs no change for this. It stays as it is.
 
 - [ ] **Step 3: Compile**
 
@@ -1239,6 +1266,50 @@ git commit -m "feat: drop inbound probes on withheld channels"
 - Produces: `/cmdguard exposure`, `/cmdguard expose <namespace>`, `/cmdguard expose global <namespace>`, `/cmdguard withhold <namespace>`.
 
 Output goes through the file's existing `feedback(ctx, Component)` helper, not through `OutboundGuard.say` — commands already have a source to reply to.
+
+**Read this before writing any of it.** `ExposureGuard.currentServerKey()` was deleted in Task 8. It derived the key from `Minecraft#getCurrentServer()`, which in 1.21.11 is `Optionull.map(this.getConnection(), ClientPacketListener::getServerData)` — it resolves through the *play* listener and is therefore null for the whole configuration phase. It was removed rather than documented, precisely so that no later code trusts it.
+
+The authoritative key now lives on the connection's own `ExposureGuard.Snapshot`, which is frozen when the connection opens. Commands run on the client thread in the play phase, so they can reach it.
+
+- [ ] **Step 0: Add a client-thread snapshot accessor**
+
+In `ExposureGuard`, add:
+
+```java
+    /**
+     * The active connection's snapshot, or null when not connected.
+     *
+     * <p>Client-thread only. This walks the play listener to reach the connection, so it is
+     * for commands and screens -- never for the filtering path, which must use the snapshot
+     * held on its own {@link ConnectionInit}.
+     */
+    public static Snapshot currentSnapshot() {
+        Minecraft client = Minecraft.getInstance();
+        ClientPacketListener listener = client == null ? null : client.getConnection();
+        if (listener == null) {
+            return null;
+        }
+        return ((ConnectionInit) (Object) listener.getConnection()).cmdguard$snapshot();
+    }
+```
+
+Verify `ClientPacketListener#getConnection()`'s exact name against the decompiled sources before relying on it.
+
+- [ ] **Step 0b: Handle a null server key**
+
+`Snapshot#serverKey()` is null on the globals-only path — singleplayer, a server transfer, or any connection whose per-server identity was not established. `/cmdguard expose` must not use null as a map key: a null or `"null"` entry in `perServerNamespaces` would accumulate grants across unrelated sessions, which is the leak this whole design exists to prevent.
+
+When `serverKey()` is null, `expose` without `--global` must refuse with an explanatory message rather than storing anything:
+
+```java
+        if (server == null) {
+            feedback(ctx, Component.literal(
+                            "No per-server identity for this connection (singleplayer, or a transfer). "
+                                    + "Use /cmdguard expose global " + value + " to allow it everywhere.")
+                    .withStyle(ChatFormatting.YELLOW));
+            return 1;
+        }
+```
 
 - [ ] **Step 1: Add the imports**
 
@@ -1291,8 +1362,12 @@ Append these methods before the private `feedback` helper:
         }
 
         long exposed = entries.stream().filter(ChannelLedger.Entry::exposed).count();
-        feedback(ctx, Component.literal("CmdGuard exposure on "
-                        + ExposureGuard.currentServerKey() + ": ")
+        ExposureGuard.Snapshot snapshot = ExposureGuard.currentSnapshot();
+        String server = snapshot == null || snapshot.serverKey() == null
+                ? "no per-server identity"
+                : snapshot.serverKey();
+
+        feedback(ctx, Component.literal("CmdGuard exposure on " + server + ": ")
                 .withStyle(ChatFormatting.GOLD)
                 .append(Component.literal(exposed + " exposed").withStyle(ChatFormatting.GREEN))
                 .append(Component.literal(", " + (entries.size() - exposed) + " withheld")
@@ -1325,7 +1400,8 @@ Append these methods before the private `feedback` helper:
                               String namespace, boolean global) {
         GuardConfig config = GuardConfig.get();
         String value = namespace.toLowerCase(Locale.ROOT);
-        String server = ExposureGuard.currentServerKey();
+        ExposureGuard.Snapshot snapshot = ExposureGuard.currentSnapshot();
+        String server = snapshot == null ? null : snapshot.serverKey();
         boolean added;
 
         if (global) {
@@ -1351,8 +1427,11 @@ Append these methods before the private `feedback` helper:
         String value = namespace.toLowerCase(Locale.ROOT);
 
         boolean removed = config.exposure.exposedNamespaces.remove(value);
-        Set<String> perServer =
-                config.exposure.perServerNamespaces.get(ExposureGuard.currentServerKey());
+        ExposureGuard.Snapshot snapshot = ExposureGuard.currentSnapshot();
+        String server = snapshot == null ? null : snapshot.serverKey();
+        Set<String> perServer = server == null
+                ? null
+                : config.exposure.perServerNamespaces.get(server);
         if (perServer != null) {
             removed |= perServer.remove(value);
         }
