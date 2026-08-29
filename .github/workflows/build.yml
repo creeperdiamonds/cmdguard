@@ -1,8 +1,11 @@
 name: build
 
 on:
+  # Every branch, not just the default one. A feature branch that only ever built on
+  # one developer's machine has not been verified anywhere reproducible -- and this
+  # project's mixin targets cannot be checked by a build at all, so the least it can do
+  # is prove it compiles on a clean checkout with a known JDK.
   push:
-    branches: [ main, master ]
   pull_request:
   workflow_dispatch:
 
