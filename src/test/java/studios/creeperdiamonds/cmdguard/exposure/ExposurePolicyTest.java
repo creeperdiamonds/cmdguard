@@ -105,13 +105,33 @@ class ExposurePolicyTest {
     /**
      * Whatever {@link ExposurePolicy#isWellFormedChannelId} accepts must be an id the
      * matching path can actually see, so the two are pinned to each other rather than
-     * merely both being asserted about.
+     * merely both being asserted about. An id placed in {@code exposedChannels} must
+     * actually be granted -- {@code assertFalse} here could never fail even if
+     * {@code isExposed} ignored {@code exposedChannels} entirely, so this asserts the
+     * direction that can.
      */
     @Test
     void anAcceptedIdCanActuallyBeMatched() {
         String id = "some-mod_2.0:a/b.c-d_e";
         assertTrue(ExposurePolicy.isWellFormedChannelId(id));
-        assertFalse(new ExposurePolicy(Set.of(), Set.of(), Set.of(id)).isExposed(id),
-                "an id the command accepts must be one a withhold entry can match");
+        assertTrue(new ExposurePolicy(Set.of(), Set.of(id), Set.of()).isExposed(id),
+                "an id the command accepts must be one a channel grant can actually match");
+    }
+
+    /**
+     * Pairs with {@link #anAcceptedIdCanActuallyBeMatched}: the same accepted id, placed in
+     * {@code withheldChannels} instead, must actually override a grant of it -- not merely
+     * fail to grant it on its own (which {@code isExposed} would do even if the
+     * {@code withheldChannels} check were deleted entirely, since an ungranted id is
+     * withheld by default). Granting via the namespace, not {@code exposedChannels}, so the
+     * only thing standing between "exposed" and "withheld" is the withhold entry itself.
+     */
+    @Test
+    void anAcceptedIdInWithheldChannelsActuallyOverridesAGrant() {
+        String id = "some-mod_2.0:a/b.c-d_e";
+        assertTrue(ExposurePolicy.isWellFormedChannelId(id));
+        ExposurePolicy policy = new ExposurePolicy(Set.of("some-mod_2.0"), Set.of(), Set.of(id));
+        assertFalse(policy.isExposed(id),
+                "a withhold entry must actually beat a namespace grant, not just coincide with the default");
     }
 }
