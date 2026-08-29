@@ -159,7 +159,94 @@ The mixin must test it, because `Connection` is shared by both sides.
   `Minecraft.getInstance().getConnection().send(createC2SPacket(payload));` — so
   third-party mod traffic funnels through `Connection#sendPacket` too.
 
-### Inbound: the client custom-payload handler
+### Inbound: `net.minecraft.network.Connection#channelRead0` — the real choke point
+
+**This is where the inbound filter lives**, and the reason is a race, not taste. Verified
+2026-08-29 by the same two readings as the rest of this section.
+
+```
+protected void channelRead0(ChannelHandlerContext, Packet<?>)
+    descriptor: (Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;)V
+```
+
+`javap` also shows the `SimpleChannelInboundHandler` bridge —
+`protected void channelRead0(ChannelHandlerContext, Object)`,
+`(Lio/netty/channel/ChannelHandlerContext;Ljava/lang/Object;)V` — so, exactly as with the
+two `handleCustomPayload` overloads, the mixin must key on the full descriptor or it can
+bind the bridge instead of the real method.
+
+```java
+public class Connection extends SimpleChannelInboundHandler<Packet<?>> {
+
+    protected void channelRead0(ChannelHandlerContext channelHandlerContext, Packet<?> packet) {
+        if (this.channel.isOpen()) {
+            PacketListener packetListener = this.packetListener;
+            if (packetListener == null) {
+                throw new IllegalStateException("Received a packet before the packet listener was initialized");
+            }
+
+            if (packetListener.shouldHandleMessage(packet)) {
+                try {
+                    genericsFtw(packet, packetListener);
+                } catch (RunningOnDifferentThreadException var5) {
+                } catch (RejectedExecutionException rejectedExecutionException) {
+                    this.disconnect(Component.translatable("multiplayer.disconnect.server_shutdown"));
+                } catch (ClassCastException classCastException) {
+                    LOGGER.error("Received {} that couldn't be processed", packet.getClass(), classCastException);
+                    this.disconnect(Component.translatable("multiplayer.disconnect.invalid_packet"));
+                }
+
+                this.receivedPackets++;
+            }
+        }
+    }
+```
+
+**Why this is complete.** `Connection` installs *itself* as the terminal inbound netty
+handler:
+
+```java
+public void configurePacketHandler(ChannelPipeline channelPipeline) {
+    channelPipeline.addLast("hackfix", new ChannelOutboundHandlerAdapter() { ... })
+        .addLast("packet_handler", this);
+}
+```
+
+Every decoded packet in every protocol phase — login, configuration, play — reaches
+`channelRead0`, and nothing reaches a `PacketListener` without passing through it first
+(`genericsFtw` is the only dispatch, and it is one line below the injection point). One
+`Connection` object survives the whole session, so one hook covers all phases.
+
+**Why not the packet listener.** The filter used to inject at `HEAD` of
+`ClientCommonPacketListenerImpl#handleCustomPayload(ClientboundCustomPayloadPacket)`.
+Fabric API 0.141.6's
+`net.fabricmc.fabric.mixin.networking.client.ClientCommonPacketListenerImplMixin` injects
+at `@At("HEAD")` of **the same method with the same descriptor** and cancels whenever
+`ClientPlayNetworkAddon` / `ClientConfigurationNetworkAddon`.`handle(payload)` returns
+`true` — i.e. whenever a client mod has a registered receiver for the channel, which is
+*precisely* the set of payloads the inbound filter exists to block. Neither mixin declared
+a priority, both default to 1000, and `@Inject(order = ...)` does not sort across mods. If
+Fabric's callback ran first the filter was a silent, total no-op. A priority number is a
+bet; `channelRead0` removes the race. Same argument as hooking `sendPacket` rather than a
+public `send` overload.
+
+Fabric API mixes into `Connection` as well (`net.fabricmc.fabric.mixin.networking.ConnectionMixin`)
+— `<init>`, `sendPacket`, `validateListener`, `channelInactive`, `handleDisconnection`,
+`setupInboundProtocol`, `setupOutboundProtocol` — but touches **no** inbound packet-handling
+method, so there is nothing here to race with.
+
+**Cancelling here is safe.** A cancelled `channelRead0` simply never hands the packet to
+the listener, which is what vanilla itself does two lines later for any payload whose
+channel has no receiver — it arrives as a `DiscardedPayload` and is dropped. The only other
+consequence is that `receivedPackets` (a debug counter) is not incremented for the dropped
+packet. The injection runs on the netty event loop, ahead of `DiscardedPayload`'s early-out
+and ahead of `PacketUtils.ensureRunningOnSameThread`, so it must do no client-world work —
+read the frozen per-connection snapshot and the payload's `Identifier`, and drop.
+
+`Connection` is shared by client and server, so the flow must be checked:
+`getReceiving() == PacketFlow.CLIENTBOUND` is the client side.
+
+### Inbound: the client custom-payload handler (no longer hooked — kept for reference)
 
 ```
 net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl

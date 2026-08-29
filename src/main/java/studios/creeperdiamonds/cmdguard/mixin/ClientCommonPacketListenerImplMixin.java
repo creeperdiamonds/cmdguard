@@ -5,7 +5,6 @@ import net.minecraft.client.multiplayer.ClientCommonPacketListenerImpl;
 import net.minecraft.client.multiplayer.CommonListenerCookie;
 import net.minecraft.client.multiplayer.ServerData;
 import net.minecraft.network.Connection;
-import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import net.minecraft.network.protocol.common.ClientboundTransferPacket;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -13,36 +12,25 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
-import studios.creeperdiamonds.cmdguard.CmdGuardClient;
 import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
 
 import java.util.Locale;
 
 /**
- * Inbound half of the exposure layer, plus wiring the per-connection snapshot into
- * existence and flagging server transfers: a mod that never receives the probe cannot
- * answer it, a connection that never gets a snapshot can only ever run under the
- * globals-only fallback, and a transferred-to server must not inherit the grants the
- * player made for the server that sent it there.
+ * Connection-lifecycle wiring for the exposure layer: bringing the per-connection snapshot
+ * into existence, and flagging server transfers. A connection that never gets a snapshot can
+ * only ever run under the globals-only fallback, and a transferred-to server must not
+ * inherit the grants the player made for the server that sent it there.
  *
- * <h2>{@code handleCustomPayload} -- the drop</h2>
- *
- * <p>The full descriptor is mandatory. This class declares two methods named
- * {@code handleCustomPayload} that differ only in parameter type, and a bare method name
- * would bind the wrong one. See {@code NOTES.md}, "Inbound: the client custom-payload
- * handler".
- *
- * <p>This injection runs OFF the client thread. Vanilla returns early for {@code
- * DiscardedPayload} before it calls {@code PacketUtils.ensureRunningOnSameThread}, so a
- * {@code HEAD} injection precedes the thread hand-off. Drop only -- there is no client-world
- * access anywhere on this path (the {@code Minecraft} import on this class is needed only
- * for the {@code <init>} injection's parameter type below, not touched here). The snapshot
- * is read off the connection itself (frozen there by Task 7's fix, populated by {@code
- * cmdguard$beginExposure} below), never recomputed via {@code
- * ExposureGuard.snapshotFor(...)} -- that would require re-deriving a server key off-thread.
- * The whole body is wrapped in a fail-closed {@code catch}: a {@code ClassCastException} on
- * the interface cast, or a throwing {@code payload().type().id()}, must withhold rather than
- * propagate onto the netty loop and tear down the connection.
+ * <p><b>The inbound filter is deliberately not here.</b> It used to be, injected at {@code
+ * HEAD} of {@code handleCustomPayload(ClientboundCustomPayloadPacket)} -- the same method,
+ * with the same descriptor, that Fabric API's own {@code
+ * net.fabricmc.fabric.mixin.networking.client.ClientCommonPacketListenerImplMixin} injects
+ * at {@code HEAD} and cancels from whenever a client mod has a receiver registered for the
+ * channel, which is exactly the set of payloads the filter exists to block. With no priority
+ * declared on either side, whether this mod's filter ran at all came down to mixin ordering.
+ * It now lives on {@code Connection#channelRead0}, upstream of every packet listener; see
+ * {@code ConnectionMixin}'s class javadoc for the full argument.
  *
  * <h2>{@code <init>} -- wiring {@code ExposureGuard.beginConnection}</h2>
  *
@@ -97,22 +85,6 @@ public abstract class ClientCommonPacketListenerImplMixin {
     @Shadow
     @Final
     protected Connection connection;
-
-    @Inject(method = "handleCustomPayload(Lnet/minecraft/network/protocol/common/ClientboundCustomPayloadPacket;)V",
-            at = @At("HEAD"), cancellable = true)
-    private void cmdguard$dropWithheldInbound(ClientboundCustomPayloadPacket packet, CallbackInfo ci) {
-        try {
-            ExposureGuard.Snapshot snapshot =
-                    ((ExposureGuard.ConnectionInit) (Object) this.connection).cmdguard$snapshot();
-
-            if (!ExposureGuard.allowInbound(packet.payload().type().id(), snapshot)) {
-                ci.cancel();
-            }
-        } catch (RuntimeException e) {
-            CmdGuardClient.LOGGER.error("[cmdguard] inbound drop check failed, withholding", e);
-            ci.cancel();
-        }
-    }
 
     @Inject(method = "<init>(Lnet/minecraft/client/Minecraft;Lnet/minecraft/network/Connection;"
             + "Lnet/minecraft/client/multiplayer/CommonListenerCookie;)V",

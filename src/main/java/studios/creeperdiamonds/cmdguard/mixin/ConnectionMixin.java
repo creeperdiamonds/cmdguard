@@ -1,9 +1,11 @@
 package studios.creeperdiamonds.cmdguard.mixin;
 
 import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.PacketFlow;
+import net.minecraft.network.protocol.common.ClientboundCustomPayloadPacket;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
@@ -11,12 +13,13 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import studios.creeperdiamonds.cmdguard.CmdGuardClient;
 import studios.creeperdiamonds.cmdguard.exposure.ExposureGuard;
 
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
- * The outbound choke point.
+ * Both choke points -- outbound and inbound.
  *
  * <p>Targets {@code Connection#sendPacket}, not any of the three public {@code send}
  * overloads. All three funnel into {@code sendPacket}, but {@code sendPacket} also has a
@@ -36,6 +39,28 @@ import java.util.concurrent.atomic.AtomicReference;
  * and may already be running on the netty event loop, which is the wrong place to cancel
  * or swap a packet.
  *
+ * <p><b>The inbound choke point lives here for the same class of reason.</b> The inbound
+ * filter used to sit at {@code HEAD} of {@code
+ * ClientCommonPacketListenerImpl#handleCustomPayload(ClientboundCustomPayloadPacket)}.
+ * Fabric API 0.141.6's own {@code
+ * net.fabricmc.fabric.mixin.networking.client.ClientCommonPacketListenerImplMixin} injects
+ * at {@code HEAD} of that exact method with that exact descriptor, and cancels whenever
+ * {@code ClientPlayNetworkAddon}/{@code ClientConfigurationNetworkAddon}{@code .handle}
+ * returns true -- which is precisely when a client mod has a registered receiver for that
+ * channel, i.e. exactly the set of payloads the inbound filter exists to block. Neither
+ * mixin declared a priority, both defaulted to 1000, and {@code @Inject(order = ...)} does
+ * not sort across mods: whichever callback the mixin processor happened to order first won,
+ * and if Fabric's won, this mod's inbound filtering never ran at all. Pinning a priority
+ * would only be a bet on a number. Moving the filter to {@code Connection#channelRead0}
+ * removes the race instead of trying to win it -- {@code Connection} is installed as the
+ * terminal {@code "packet_handler"} in the netty pipeline (see {@code
+ * Connection#configurePacketHandler}), so {@code channelRead0} is where every decoded
+ * inbound packet in every protocol phase arrives, strictly before any {@code PacketListener}
+ * -- Fabric's addon included -- is handed it. Fabric API mixes into {@code Connection} too
+ * but touches no inbound handler method, so there is nothing here to race with. This is the
+ * same argument that put the outbound filter on {@code sendPacket} rather than on a public
+ * {@code send} overload.
+ *
  * <p><b>Per-connection snapshot.</b> {@code sendPacket} provably runs on two threads (the
  * client thread via {@code ClientCommonPacketListenerImpl#send}, and the netty event loop
  * via the {@code runOnceConnected} lambda and the {@code pendingActions} drain), and a
@@ -43,15 +68,19 @@ import java.util.concurrent.atomic.AtomicReference;
  * shared, mutable state on every packet -- which either races or lets a mid-session toggle
  * apply inconsistently within one connection -- this mixin holds the whole decision surface
  * ({@link ExposureGuard.Snapshot}) as a field on the {@code Connection} instance itself. A
- * new connection is a new {@code Connection} object with a fresh, {@code null} field, so
- * there is no shared cell a stale write from a previous connection could land in: the
- * cross-connection leak a static holder was vulnerable to is structurally impossible here.
+ * new connection is a new {@code Connection} object whose {@code AtomicReference} holds
+ * {@code null}, so there is no shared cell a stale write from a previous connection could
+ * land in: the cross-connection leak a static holder was vulnerable to is structurally
+ * impossible here.
  */
 @Mixin(Connection.class)
 public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
 
     @Shadow
     public abstract PacketFlow getSending();
+
+    @Shadow
+    public abstract PacketFlow getReceiving();
 
     /**
      * The real, per-server decision surface for this connection, once installed. Written
@@ -111,8 +140,15 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
      * ExposureGuard.beginConnection}'s Javadoc for why a second, silently-accepted call here
      * used to be a real leak (it would replace a real per-server snapshot with a
      * {@code "singleplayer"} fallback for the rest of the connection's life).
+     *
+     * <p>Deliberately <em>not</em> {@code @Unique}. On a non-private method that annotation
+     * means "discard this method if another mixin already added one with the same name and
+     * descriptor" -- and a discarded {@code cmdguard$initExposure} would leave {@code
+     * Connection} declaring {@link ExposureGuard.ConnectionInit} with no implementation of
+     * it, i.e. an {@code AbstractMethodError} on the first call. The {@code cmdguard$}
+     * prefix makes a collision essentially impossible, so this was only ever theoretical;
+     * dropping the annotation removes the failure mode outright.
      */
-    @Unique
     @Override
     public boolean cmdguard$initExposure(ExposureGuard.Snapshot snapshot) {
         return cmdguard$snapshot.compareAndSet(null, snapshot);
@@ -125,8 +161,9 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
      * #cmdguard$fallback} field. This method only ever reads {@link #cmdguard$snapshot}, via
      * {@link AtomicReference#get()} -- it must never write to it, since that cell exists
      * solely to record whether the real, one-time install has happened.
+     *
+     * <p>Not {@code @Unique}, for the same reason as {@link #cmdguard$initExposure}.
      */
-    @Unique
     @Override
     public ExposureGuard.Snapshot cmdguard$snapshot() {
         ExposureGuard.Snapshot installed = cmdguard$snapshot.get();
@@ -160,5 +197,50 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
             return packet;
         }
         return ExposureGuard.rewriteOrSame(packet, cmdguard$snapshot());
+    }
+
+    /**
+     * The inbound choke point: a mod that never receives the probe cannot answer it.
+     *
+     * <p>Runs on the netty event loop, before {@code channelRead0} consults {@code
+     * packetListener} at all -- so before Fabric API's addon dispatch, before vanilla's
+     * {@code DiscardedPayload} early-out, and before {@code
+     * PacketUtils.ensureRunningOnSameThread}. Do no client-world work here; the body only
+     * reads this connection's own frozen snapshot and an {@code Identifier}, and drops.
+     *
+     * <p>Cancelling here simply means the packet is never handed to the listener -- exactly
+     * what vanilla itself does for a payload whose channel has no receiver, which arrives as
+     * a {@code DiscardedPayload} and is dropped a few lines further down. The only other
+     * effect of cancelling is that {@code receivedPackets} is not incremented for the
+     * dropped packet, which is a debug counter.
+     *
+     * <p>{@code Connection} is shared by both sides, so the flow is checked: only a
+     * connection that <em>receives</em> clientbound traffic is a client connection. (A
+     * {@code ClientboundCustomPayloadPacket} could not reach a serverbound-receiving
+     * connection anyway; the check is the same belt-and-braces as the outbound side's.)
+     *
+     * <p>Fail closed: any {@code RuntimeException} in here withholds rather than propagating
+     * onto the netty loop and tearing the connection down.
+     */
+    @Inject(method = "channelRead0(Lio/netty/channel/ChannelHandlerContext;Lnet/minecraft/network/protocol/Packet;)V",
+            at = @At("HEAD"), cancellable = true)
+    private void cmdguard$dropWithheldInbound(ChannelHandlerContext context,
+                                              Packet<?> packet,
+                                              CallbackInfo ci) {
+        // Outside the catch on purpose: neither a field read nor an instanceof can throw,
+        // and a fail-closed cancel must only ever be able to drop a custom payload -- never
+        // some unrelated packet this filter has no business touching.
+        if (getReceiving() != PacketFlow.CLIENTBOUND
+                || !(packet instanceof ClientboundCustomPayloadPacket custom)) {
+            return;
+        }
+        try {
+            if (!ExposureGuard.allowInbound(custom.payload().type().id(), cmdguard$snapshot())) {
+                ci.cancel();
+            }
+        } catch (RuntimeException e) {
+            CmdGuardClient.LOGGER.error("[cmdguard] inbound drop check failed, withholding", e);
+            ci.cancel();
+        }
     }
 }
