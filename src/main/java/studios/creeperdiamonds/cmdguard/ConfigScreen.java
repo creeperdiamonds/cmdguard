@@ -16,18 +16,57 @@ import net.minecraft.network.chat.Component;
  * a setting a different button owns.
  */
 public final class ConfigScreen extends Screen {
+
+    private static final int ROW_HEIGHT = 20;
+
+    /** Offset of the {@code Done} row from the top of the stack: the last row plus a gap. */
+    private static final int DONE_OFFSET = 180;
+
+    /** Kept clear below {@code Done}, so it is never flush against the window edge. */
+    private static final int BOTTOM_MARGIN = 8;
+
     private final Screen parent;
+
+    /** Where {@link #init()} put the top row, so {@link #render} can put the title above it. */
+    private int stackTopY;
 
     public ConfigScreen(Screen parent) {
         super(Component.literal("CmdGuard"));
         this.parent = parent;
     }
 
+    /**
+     * Where the first row goes: a quarter down the screen, but never so far down that
+     * {@code Done} would fall off the bottom.
+     *
+     * <p>Package-private and static so {@code ConfigScreenLayoutTest} can check the arithmetic
+     * for a small window without a game client. The defect this exists to prevent is not
+     * cosmetic: {@code Done} is the only way to leave this screen, and the suggestion-guard
+     * toggle grew the stack to seven rows, putting {@code Done} at {@code height/4 + 180} --
+     * bottom edge {@code height/4 + 200}. Minecraft's own {@code Window#calculateScale} only
+     * raises the GUI scale while {@code framebufferHeight / (scale + 1) >= 240}, so 240 is the
+     * usual floor for the scaled height, and at 240 that put {@code Done} at 240..260: entirely
+     * below the window. ("Force Unicode Font" bumps the scale one further and can go lower
+     * still, which is why the clamp below has no lower bound.)
+     *
+     * <p>Clamped only downwards, deliberately. On any comfortable height this returns {@code
+     * height / 4} and the layout is exactly what it always was. On a short window the whole
+     * stack slides up together, keeping the 16px gap above {@code Done} intact, so the two can
+     * never overlap and produce a {@code Done} button that is on-screen but not clickable. On
+     * an absurdly short window the top rows go off the top instead -- the honest outcome for
+     * seven rows that do not fit, and the one that still leaves {@code Done} reachable.
+     */
+    static int stackTop(int screenHeight) {
+        return Math.min(screenHeight / 4,
+                screenHeight - BOTTOM_MARGIN - DONE_OFFSET - ROW_HEIGHT);
+    }
+
     @Override
     protected void init() {
         GuardConfig config = GuardConfig.get();
         int centerX = this.width / 2;
-        int y = this.height / 4;
+        int y = stackTop(this.height);
+        this.stackTopY = y;
 
         // Toggling the guard also changes what the two exposure labels below must read --
         // config.enabled gates the exposure layer as well -- so this rebuilds the whole
@@ -89,7 +128,8 @@ public final class ConfigScreen extends Screen {
 
         this.addRenderableWidget(Button.builder(
                 Component.literal("Done"),
-                button -> this.onClose()).bounds(centerX - 100, y + 180, 200, 20).build());
+                button -> this.onClose())
+                .bounds(centerX - 100, y + DONE_OFFSET, 200, ROW_HEIGHT).build());
     }
 
     /**
@@ -160,7 +200,8 @@ public final class ConfigScreen extends Screen {
     @Override
     public void render(net.minecraft.client.gui.GuiGraphics graphics, int mouseX, int mouseY, float delta) {
         super.render(graphics, mouseX, mouseY, delta);
-        graphics.drawCenteredString(this.font, this.title, this.width / 2, this.height / 4 - 24, 0xFFFFFF);
+        // Tied to the stack rather than to height/4, so it travels with it on a short window.
+        graphics.drawCenteredString(this.font, this.title, this.width / 2, this.stackTopY - 24, 0xFFFFFF);
     }
 
     @Override
