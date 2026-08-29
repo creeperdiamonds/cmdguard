@@ -49,8 +49,14 @@ tasks.withType(JavaCompile).configureEach {
 
 java {
     withSourcesJar()
-    sourceCompatibility = JavaVersion.VERSION_21
-    targetCompatibility = JavaVersion.VERSION_21
+
+    // Pins the compile and test JVM instead of inheriting whichever JDK happens to be
+    // running Gradle. This machine has 17, 21 and 25 installed. Note this does NOT change
+    // the JVM the Gradle daemon itself runs on -- Loom still requires Gradle to be launched
+    // on JDK 21.
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(21)
+    }
 }
 
 tasks.named('test') {
