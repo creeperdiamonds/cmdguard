@@ -9,7 +9,7 @@ API branch `1.21.11`. This project uses **official Mojang mappings**.
 |---|---|---|---|
 | 1 | `CommandRegistrationCallback` instead of `ClientCommandRegistrationCallback` | one word apart; both compile | reference command uses the client one |
 | 2 | `connection.sendCommand(...)` as a "quick fix" | looks like the obvious way to run a command | that IS the hooked path — it's guarded |
-| 3 | `SuggestionProviders.ASK_SERVER` on a client arg | tab-completion sends a packet; command itself looks fine | avoid on client commands; none used here |
+| 3 | `SuggestionProviders.ASK_SERVER` on a client arg | tab-completion sends a packet; command itself looks fine | avoid on client commands; none used here — and the suggestion guard now filters the packet itself, without exempting client roots |
 | 4 | player feedback via a server-routed message | safe path is `Minecraft#gui.getChat().addMessage` | `OutboundGuard.say` / `sendFeedback` only |
 | 5 | a generic root literal | shadows the server command AND falls through when this mod isn't loaded | root is the mod id `cmdguard` |
 | 6 | registering a custom networking channel | announced via `minecraft:register` | this mod registers none |
@@ -183,6 +183,8 @@ in this file was verified with `javap` against the mapped jar for exactly this r
 
 - `ClientPacketListener#sendCommand(String)`
 - `ClientPacketListener#sendUnattendedCommand(String, Screen)` — clicked/menu commands
+- `ServerboundCommandSuggestionPacket(int id, String command)` — tab completion; reaches
+  `Connection#sendPacket` like everything else, accessors are `getId()` / `getCommand()`
 - `net.minecraft.resources.Identifier` — **renamed from `ResourceLocation`** in 1.21.11
 - `ClientPlayNetworking.getGlobalReceivers() / getSendable() / canSend(Identifier)`
 - `C2SPlayChannelEvents.Register.onChannelRegister(handler, sender, client, List<Identifier>)`
@@ -309,6 +311,113 @@ The mixin must test it, because `Connection` is shared by both sides.
   Mojang-remapped Fabric sources jar) ends in
   `Minecraft.getInstance().getConnection().send(createC2SPacket(payload));` — so
   third-party mod traffic funnels through `Connection#sendPacket` too.
+
+### Outbound: tab-completion requests — the command guard's second half
+
+Verified 2026-08-29 the same two ways as everything else in this section: the decompiled
+1.21.11 sources from the `genSources` jar, and `javap` over the Mojang-mapped merged jar
+for every descriptor.
+
+**The leak.** `ClientPacketListenerMixin` guards `sendCommand` and
+`sendUnattendedCommand`, so `/somemod:debug` never leaves the client. Pressing Tab sends
+the same text earlier. From `net.minecraft.client.multiplayer.ClientSuggestionProvider`:
+
+```java
+@Override
+public CompletableFuture<Suggestions> customSuggestion(CommandContext<?> commandContext) {
+    if (this.pendingSuggestionsFuture != null) {
+        this.pendingSuggestionsFuture.cancel(false);
+    }
+
+    this.pendingSuggestionsFuture = new CompletableFuture<>();
+    int i = ++this.pendingSuggestionsId;
+    this.connection.send(new ServerboundCommandSuggestionPacket(i, commandContext.getInput()));
+    return this.pendingSuggestionsFuture;
+}
+```
+
+**The packet** (`javap -p -s`, mapped merged jar). Note it is a plain class, **not** a
+record — the accessors are `getId()` / `getCommand()`, not `id()` / `command()`:
+
+```
+net.minecraft.network.protocol.game.ServerboundCommandSuggestionPacket
+    public class ... implements Packet<ServerGamePacketListener>
+    private final int id;
+    private final java.lang.String command;
+
+    public ServerboundCommandSuggestionPacket(int, java.lang.String)
+        descriptor: (ILjava/lang/String;)V
+    public int getId()
+        descriptor: ()I
+    public java.lang.String getCommand()
+        descriptor: ()Ljava/lang/String;
+```
+
+**It reaches the existing outbound choke point, so no new mixin was needed.** The field
+`ClientSuggestionProvider.connection` is a `ClientPacketListener`, and
+`ClientCommonPacketListenerImpl#send(Packet<?>)` is a one-line
+`{ this.connection.send(packet); }` into `Connection#send(Packet)`, which is
+`send(packet, null)` → `send(packet, null, true)` → `sendPacket(...)` — the private funnel
+this file already documents above. The guard is therefore one more `@Inject` at `HEAD` of
+`sendPacket`, alongside the exposure layer's.
+
+**What the string actually contains.** Brigadier decides this, not Minecraft.
+`CommandDispatcher#getCompletionSuggestions(ParseResults, int cursor)` — read from the
+bytecode of `brigadier-1.3.10.jar` — does:
+
+```
+30: aload_1  ParseResults.getReader()          // the StringReader the caller passed in
+34:          ImmutableStringReader.getString() // the WHOLE line, slash included
+43: iconst_0
+44: iload_2  cursor
+45:          String.substring(0, cursor)       // -> the string handed to build(...)
+122:         CommandContextBuilder.build(<that substring>)
+```
+
+So `commandContext.getInput()` is **the typed line truncated at the cursor**, and it keeps
+whatever leading `/` the edit box had. Which it has depends on the screen:
+
+- `ChatScreen` builds `new CommandSuggestions(..., commandsOnly = false, ...)`, and
+  `CommandSuggestions#updateCommandInfo` only takes the dispatcher branch when the text
+  starts with `/`. So chat text carries the slash.
+- `AbstractCommandBlockEditScreen` builds it with `commandsOnly = true`, and its box has no
+  slash. Its completion requests ride this same packet with no leading `/`.
+- **Plain chat suggestions never produce this packet at all.** The non-command branch of
+  `updateCommandInfo` is `SharedSuggestionProvider.suggest(getCustomTabSugggestions(), ...)`
+  — a local list of player names, no packet. So "no leading slash" here means "command
+  block", not "chat".
+
+Vanilla's server half agrees: `ServerGamePacketListenerImpl#handleCustomCommandSuggestions`
+opens with `new StringReader(packet.getCommand())` and skips a `'/'` only `if
+(stringReader.canRead() && stringReader.peek() == '/')`. `CommandRoot.of` matches that.
+
+**Command *names* are completed locally.** Worth recording, because it sizes the usability
+cost of the conservative policy. `updateCommandInfo` parses against
+`ClientPacketListener#getCommands()` — the tree the server already sent in
+`ClientboundCommandsPacket` — and brigadier's `getCompletionSuggestions` iterates
+`nodeBeforeCursor.parent.getChildren()` calling `listSuggestions` on each. A root-level
+child is a `LiteralCommandNode`, whose `listSuggestions` matches literals in memory and
+sends nothing. Only an **argument** node whose suggestion provider asks the server (vanilla's
+`SuggestionProviders.ASK_SERVER`, which routes to `SharedSuggestionProvider#customSuggestion`)
+produces a `ServerboundCommandSuggestionPacket`. So `/ms<Tab>` normally sends nothing, and
+withholding it costs nothing. The policy is still enforced conservatively because the command
+tree is server-supplied: a server that wanted the client's keystrokes could hang an
+`ASK_SERVER` argument node directly under the root and receive every character typed after
+the slash.
+
+**Cancelling the packet is safe.** `customSuggestion` has already stored its
+`CompletableFuture` in `CommandSuggestions.pendingSuggestions`. Every read of that field is
+guarded: the render path tests `this.pendingSuggestions != null && this.pendingSuggestions
+.isDone()` before `join()`, and the only other `join()` (in `updateUsageInfo`) runs solely
+from the `thenRun` callback that a completion triggers. A future that never completes leaves
+the popup empty and nothing else; the next keystroke's `customSuggestion` cancels it. No
+`join()` on an incomplete future exists, so there is no hang and no exception.
+
+**Leak vector #3, closed.** The table at the top of this file has warned since day one that
+`SuggestionProviders.ASK_SERVER` on a *client* command's argument sends a packet while the
+command itself looks local. That is why the suggestion guard deliberately does **not** exempt
+a client-dispatcher root the way `OutboundGuard#shouldBlock` does: for a typed command, a
+client root never reaches the network; for a completion request it does.
 
 ### Inbound: `net.minecraft.network.Connection#channelRead0` — the real choke point
 

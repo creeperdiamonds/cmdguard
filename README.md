@@ -22,6 +22,10 @@ advertises a channel or identifier the client does not actually have. See
   gives you strict default-deny.
 - **Clicked-command policy.** Plugin menus fire commands via a different path when you
   click them; those are allowed by default (toggle in config) so server GUIs keep working.
+- **Tab-completion guard.** Pressing Tab sends the partial command to the server *before*
+  you press enter, so a guard that only checked what you send on enter would be leaking the
+  same text one step earlier. Completion requests are judged by the same allowlist. This has
+  a real cost — see [Tab completion](#tab-completion). On by default.
 - **Channel audit.** `/cmdguard audit` lists every installed mod that has registered a
   networking channel — i.e. every mod a server could ask something of. This is the real,
   checkable version of "what can a server see about me."
@@ -51,8 +55,8 @@ advertises a channel or identifier the client does not actually have. See
 | `/cmdguard withhold channel <id>` | Withhold one channel everywhere, even where its namespace is exposed |
 
 Config lives at `config/cmdguard.json`. A settings screen is available via Mod Menu,
-with toggles for the guard, clicked-command policy, the exposure whitelist, and
-whether inbound probes on withheld channels are blocked.
+with toggles for the guard, clicked-command policy, tab completion, the exposure whitelist,
+whether inbound probes on withheld channels are blocked, and login queries.
 
 Note that `/cmdguard off` switches the exposure whitelist off along with the command
 guard — it is the master switch for both. The config screen, `/cmdguard status` and
@@ -187,6 +191,47 @@ not do that.
 
 You can switch this off on its own — "Login queries" in the Mod Menu settings screen —
 without disabling the rest of the exposure whitelist. It is on by default.
+
+## Tab completion
+
+**Pressing Tab sends what you have typed so far to the server.** That is vanilla
+behaviour, not something a mod added: the client asks the server to complete an argument
+by putting the partial command on the wire. So blocking `/somemod:debug` on enter while
+happily sending `somemod:debug` as a completion request would not be much of a guard.
+
+CmdGuard judges a completion request by **the same allowlist as the command it would
+become**. There is no second list and no second policy to keep in sync.
+
+**What that costs you, stated plainly rather than left to be discovered:**
+
+- **A command *name* cannot be completed against the server — only its arguments.** A
+  partial command does not yet have a complete root. `/ms` has the root `ms`, which is not
+  on your allowlist even though you are on your way to `/msg`, so CmdGuard withholds it.
+  The alternative — allowing anything that is a prefix of an allowlisted root — would send
+  `/m`, `/ms` and every other prefix to the server, which is exactly the keystroke leak
+  this is meant to stop. The strict reading is the correct trade for this mod.
+- **In practice you will rarely notice**, because the client completes command *names*
+  from its own copy of the command tree without asking the server at all. A request only
+  goes out when an *argument* asks the server — for example a player-name argument. So
+  `/ms<Tab>` normally sends nothing either way; what changes is that `/somemod:debug <Tab>`
+  no longer asks the server to complete its arguments. The rule is still enforced strictly,
+  because the command tree comes from the server and a server that wanted your keystrokes
+  could ask to be consulted right at the root.
+- **Completions for allowlisted commands keep working.** `/msg <Tab>` still completes
+  player names, because `msg` is on the allowlist.
+- **A blocked request is silent.** Tab simply shows nothing — there is no chat message,
+  because a request goes out on every keystroke and a message per keystroke would bury
+  your chat. The first time a given root is withheld, one line naming it and the
+  `/cmdguard allow <root>` remedy goes to `logs/latest.log`.
+- **Client commands from other mods are not exempt here**, unlike on the typed-command
+  path. A client mod's command never reaches the network when you run it — but if that mod
+  asks the server to complete one of its arguments (a real and easy mistake), the request
+  does, and it names the mod's command. That is one of the leak vectors CmdGuard exists to
+  catch, so it is not waved through.
+
+Switch it off on its own with the "Tab completion" toggle in the Mod Menu settings screen;
+`/cmdguard status` reports its state. `/cmdguard off` turns it off along with everything
+else.
 
 ## What is not covered
 

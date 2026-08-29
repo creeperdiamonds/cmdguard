@@ -27,7 +27,9 @@ below is subordinate to them.
 - `minecraft:brand` is untouched and truthful. The client does not claim to be vanilla.
 - Never fabricate. No channel is ever advertised that the client did not register; no
   identifier is ever sent that the client does not actually have.
-- Behavioural fingerprinting (timing, capability, tab-completion text) is out of scope.
+- Behavioural fingerprinting (timing, capability) is out of scope. Tab-completion *text*
+  no longer is: it is guarded by the command allowlist — see "The tab-completion
+  suggestion guard" below.
 
 Withholding is silence. Fabrication is a lie. This feature does the first and never the
 second.
@@ -443,7 +445,75 @@ minimum that must be run once by hand before this is called done:
 A packet capture of the configuration phase, if the tester can take one, is the only
 direct evidence that no withheld identifier reached the wire.
 
+## The tab-completion suggestion guard
+
+Listed here as out of scope until 2026-08-29, on the reasoning that it was a separate
+feature with a separate mechanism. Half of that was wrong, and it is now implemented.
+
+**The leak.** `ClientSuggestionProvider#customSuggestion` sends
+`new ServerboundCommandSuggestionPacket(i, commandContext.getInput())` — the partial
+command, truncated at the cursor — the moment tab completion runs. The command guard
+blocks `/somemod:debug` on the way to `sendCommand`; without this, the same text left the
+client one keystroke earlier as a completion request.
+
+**Not a separate mechanism.** The packet goes out through `ClientPacketListener#send`,
+which is a one-line delegation to `Connection#send` and hence to `Connection#sendPacket`
+— the outbound choke point this design already hooks for the exposure layer. So the guard
+is one more `@Inject` on the existing `ConnectionMixin`, not a new mixin and not a new
+interception point. Verified against the decompiled 1.21.11 sources and, for the
+accessors (`getId()` / `getCommand()`; it is a class, not a record), `javap` over the
+mapped merged jar. See `NOTES.md`, "Outbound: tab-completion requests".
+
+**It is a separate *policy* surface, though, and stays separate.** This is the command
+guard's rule, not the exposure whitelist's: `SuggestionFilter` reads `GuardConfig.allowlist`
+and nothing else. A suggestion request is judged by exactly the rule that governs the
+command it would become — one list, so the two can never disagree. The exposure policy is
+not consulted, and the toggle lives on `GuardConfig` (`guardSuggestions`, a primitive
+`boolean` with a `true` initializer, like `enabled` and `allowClickedCommands`) rather than
+in `ExposureSettings`, because putting it there would have gated a command-guard rule behind
+`exposure.enabled`.
+
+**The partial-root decision.** A partial command may not have a complete root yet: `/ms`
+has root `ms`, which is not on the allowlist even though the user is heading for `/msg`.
+It is withheld. The alternative — a prefix rule — would send every prefix of an allowlisted
+root to the server, i.e. leak the keystrokes the guard exists to protect. The cost is that a
+command *name* cannot be completed against the server, only its arguments; the README states
+this in those words rather than leaving a user to discover it. The cost is smaller than it
+reads: command names are completed locally from the client's copy of the command tree, and
+only an *argument* node that asks the server produces this packet at all. The rule is still
+enforced strictly, because the command tree is server-supplied and a server could put an
+asks-the-server argument node directly under the root.
+
+**Edges, decided rather than defaulted.**
+
+- *Empty input* (`""`, or `"/"` alone) — withheld. `OutboundGuard#shouldBlock` lets an
+  empty root through because an empty command sends nothing; here the text is on the wire
+  either way, so it is judged, and an empty root is on no allowlist.
+- *No leading slash* — judged as a command anyway. Plain chat suggestions never reach this
+  packet (`CommandSuggestions#updateCommandInfo` serves them from a local player-name list),
+  so slashless text here comes from `AbstractCommandBlockEditScreen`, where it *is* a
+  command. Vanilla's `handleCustomCommandSuggestions` strips an optional `/` for the same
+  reason; `CommandRoot.of` matches it.
+- *A root the client handles locally* — **not** exempt, unlike on the typed-command path.
+  A client command never reaches the network when run, but its completion request does, and
+  `NOTES.md`'s leak vector #3 is exactly a client mod hanging `ASK_SERVER` on its own
+  argument. Exempting client roots would wave through the case this is best placed to catch.
+
+**Failure behaviour.** Fail closed, like everything else here: an exception while deciding
+cancels the send. The `instanceof` sits outside the `try`, so a fail-closed cancel can only
+ever drop a suggestion request, never an unrelated packet. Cancelling is safe — the
+`CompletableFuture` `customSuggestion` returned is only ever read behind an `isDone()` check
+in `CommandSuggestions`, so an uncompleted one leaves the popup empty and is cancelled by the
+next keystroke. No chat message is emitted (a request per keystroke would bury the chat, and
+this can run on the netty event loop); one INFO line per withheld root goes to `latest.log`.
+
+**Testing.** `SuggestionFilter` and `CommandRoot` are Minecraft-free and unit-tested:
+allowlisted root, non-allowlisted root, partial root, empty, slashless text, both switches
+off, a null allowlist and an allowlist that throws (both fail closed), strict mode, and the
+invariant that the suggestion decision agrees with the command decision on the same
+allowlist. The mixin binding itself is launch-time and remains untested, as elsewhere.
+
 ## Out of scope
 
-The tab-completion suggestion guard (`ServerboundCommandSuggestionPacket` sends partial
-command text before you press enter). Separate feature, separate mechanism.
+Behavioural fingerprinting: timing, capability probing, and what the client's *behaviour*
+reveals as opposed to what it says.
