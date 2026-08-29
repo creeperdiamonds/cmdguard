@@ -94,6 +94,20 @@ public final class GuardConfig {
         }
     }
 
+    /**
+     * Whether the exposure layer is actually filtering anything.
+     *
+     * <p>{@link #enabled} is the guard's master switch and gates the exposure layer too, so
+     * {@code /cmdguard off} silently stops exposure filtering as well. Everything that
+     * reports exposure state to the user -- the config screen, {@code /cmdguard status},
+     * {@code /cmdguard exposure}, the join-time line -- must ask this rather than
+     * {@code exposure.enabled}, or it will claim the whitelist is on while nothing is being
+     * withheld. This method is the single place that conjunction lives.
+     */
+    public boolean exposureActive() {
+        return enabled && exposure.enabled;
+    }
+
     public boolean allow(String root) {
         boolean changed = allowlist.add(root.toLowerCase(Locale.ROOT));
         if (changed) {

@@ -81,7 +81,32 @@ public final class CmdGuardCommands {
                         + " allowlisted, clicked commands "
                         + (config.allowClickedCommands ? "allowed" : "blocked") + ")")
                         .withStyle(ChatFormatting.GRAY)));
+
+        // The exposure layer is gated on config.enabled too, so /cmdguard off turns it off
+        // as well. Reporting exposure.enabled on its own here would tell the player the
+        // whitelist is on while nothing at all is being withheld.
+        feedback(ctx, Component.literal("Exposure whitelist is ")
+                .withStyle(ChatFormatting.GOLD)
+                .append(config.exposureActive()
+                        ? Component.literal("ON").withStyle(ChatFormatting.GREEN)
+                        : Component.literal("OFF").withStyle(ChatFormatting.RED))
+                .append(Component.literal("  (" + exposureQualifier(config) + ")")
+                        .withStyle(ChatFormatting.GRAY)));
         return 1;
+    }
+
+    /** The parenthetical that says <em>why</em> exposure filtering is in the state it is. */
+    private static String exposureQualifier(GuardConfig config) {
+        if (!config.exposure.enabled) {
+            return "switched off in the config screen";
+        }
+        if (!config.enabled) {
+            return "the exposure toggle is on, but /cmdguard off disables it too -- "
+                    + "run /cmdguard on to restore it";
+        }
+        return "inbound probes "
+                + (config.exposure.filterInbound ? "blocked" : "allowed")
+                + ", " + config.exposure.exposedNamespaces.size() + " namespaces exposed";
     }
 
     private static int setEnabled(CommandContext<FabricClientCommandSource> ctx, boolean value) {
@@ -128,6 +153,22 @@ public final class CmdGuardCommands {
 
     private static int exposure(CommandContext<FabricClientCommandSource> ctx) {
         List<ChannelLedger.Entry> entries = ExposureGuard.ledger().snapshot();
+        ExposureGuard.Snapshot connectionSnapshot = ExposureGuard.currentSnapshot();
+
+        // Said first, and unconditionally: an empty ledger because filtering is off reads
+        // exactly like an empty ledger because nothing happened, and the difference is the
+        // whole point of the readout. The connection's own frozen snapshot is authoritative
+        // here, not the live config -- a mid-session toggle does not change this connection.
+        if (connectionSnapshot != null && !connectionSnapshot.active()) {
+            feedback(ctx, Component.literal("Exposure filtering is ")
+                    .withStyle(ChatFormatting.GOLD)
+                    .append(Component.literal("OFF").withStyle(ChatFormatting.RED))
+                    .append(Component.literal(" for this connection -- nothing below was withheld"
+                                    + (GuardConfig.get().exposure.enabled
+                                    ? ", because /cmdguard off disables the exposure layer too."
+                                    : "."))
+                            .withStyle(ChatFormatting.GRAY)));
+        }
 
         if (entries.isEmpty()) {
             feedback(ctx, Component.literal("No channels observed yet on this connection.")
@@ -136,10 +177,9 @@ public final class CmdGuardCommands {
         }
 
         long exposed = entries.stream().filter(ChannelLedger.Entry::exposed).count();
-        ExposureGuard.Snapshot snapshot = ExposureGuard.currentSnapshot();
-        String server = snapshot == null || snapshot.serverKey() == null
+        String server = connectionSnapshot == null || connectionSnapshot.serverKey() == null
                 ? "no per-server identity"
-                : snapshot.serverKey();
+                : connectionSnapshot.serverKey();
 
         feedback(ctx, Component.literal("CmdGuard exposure on " + server + ": ")
                 .withStyle(ChatFormatting.GOLD)

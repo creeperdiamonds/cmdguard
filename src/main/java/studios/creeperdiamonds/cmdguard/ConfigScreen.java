@@ -9,6 +9,10 @@ import net.minecraft.network.chat.Component;
  * /cmdguard allow|deny and the exposure whitelist's namespaces via /cmdguard
  * expose|withhold, so this only surfaces the four toggles (guard, clicked-command
  * policy, exposure whitelist, inbound-probe filtering) plus a channel audit button.
+ *
+ * <p>Every toggle rebuilds the whole screen rather than relabelling its own button, because
+ * the guard's master switch also gates the exposure layer: the two exposure labels depend on
+ * a setting a different button owns.
  */
 public final class ConfigScreen extends Screen {
     private final Screen parent;
@@ -24,12 +28,15 @@ public final class ConfigScreen extends Screen {
         int centerX = this.width / 2;
         int y = this.height / 4;
 
+        // Toggling the guard also changes what the two exposure labels below must read --
+        // config.enabled gates the exposure layer as well -- so this rebuilds the whole
+        // screen rather than only relabelling itself.
         this.addRenderableWidget(Button.builder(
                 Component.literal("Guard: " + (config.enabled ? "ON" : "OFF")),
                 button -> {
                     config.enabled = !config.enabled;
                     config.save();
-                    button.setMessage(Component.literal("Guard: " + (config.enabled ? "ON" : "OFF")));
+                    this.rebuildWidgets();
                 }).bounds(centerX - 100, y, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
@@ -37,8 +44,7 @@ public final class ConfigScreen extends Screen {
                 button -> {
                     config.allowClickedCommands = !config.allowClickedCommands;
                     config.save();
-                    button.setMessage(Component.literal("Clicked commands: "
-                            + (config.allowClickedCommands ? "allowed" : "blocked")));
+                    this.rebuildWidgets();
                 }).bounds(centerX - 100, y + 24, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
@@ -49,27 +55,52 @@ public final class ConfigScreen extends Screen {
                 }).bounds(centerX - 100, y + 48, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
-                Component.literal("Exposure whitelist: " + (config.exposure.enabled ? "ON" : "OFF")),
+                exposureLabel(config),
                 button -> {
                     config.exposure.enabled = !config.exposure.enabled;
                     config.save();
-                    button.setMessage(Component.literal("Exposure whitelist: "
-                            + (config.exposure.enabled ? "ON" : "OFF")));
+                    this.rebuildWidgets();
                 }).bounds(centerX - 100, y + 72, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
-                Component.literal("Inbound probes: "
-                        + (config.exposure.filterInbound ? "blocked" : "allowed")),
+                inboundLabel(config),
                 button -> {
                     config.exposure.filterInbound = !config.exposure.filterInbound;
                     config.save();
-                    button.setMessage(Component.literal("Inbound probes: "
-                            + (config.exposure.filterInbound ? "blocked" : "allowed")));
+                    this.rebuildWidgets();
                 }).bounds(centerX - 100, y + 96, 200, 20).build());
 
         this.addRenderableWidget(Button.builder(
                 Component.literal("Done"),
                 button -> this.onClose()).bounds(centerX - 100, y + 132, 200, 20).build());
+    }
+
+    /**
+     * The exposure toggle's label, reflecting the state that is actually in force.
+     *
+     * <p>{@code config.enabled} gates the exposure layer too, so this button used to read
+     * "Exposure whitelist: ON" while {@code /cmdguard off} had switched all filtering off --
+     * the screen asserting a protection that was not running. The button still toggles
+     * {@code exposure.enabled} (its own setting); only what it claims changed.
+     */
+    private static Component exposureLabel(GuardConfig config) {
+        if (!config.exposure.enabled) {
+            return Component.literal("Exposure whitelist: OFF");
+        }
+        return Component.literal(config.enabled
+                ? "Exposure whitelist: ON"
+                : "Exposure whitelist: ON (inactive, guard off)");
+    }
+
+    /** Likewise: inbound probes are only blocked while the exposure layer is actually running. */
+    private static Component inboundLabel(GuardConfig config) {
+        if (!config.exposureActive()) {
+            return Component.literal("Inbound probes: "
+                    + (config.exposure.filterInbound ? "blocked" : "allowed")
+                    + " (inactive)");
+        }
+        return Component.literal("Inbound probes: "
+                + (config.exposure.filterInbound ? "blocked" : "allowed"));
     }
 
     @Override

@@ -272,7 +272,7 @@ public final class ExposureGuard {
     public static Snapshot snapshotFor(String serverKey) {
         GuardConfig config = GuardConfig.get();
         return new Snapshot(
-                config.enabled && config.exposure.enabled,
+                config.exposureActive(),
                 config.exposure.filterInbound,
                 config.exposure.policyFor(serverKey),
                 serverKey);
@@ -306,7 +306,7 @@ public final class ExposureGuard {
                 config.exposure.exposedNamespaces,
                 config.exposure.exposedChannels,
                 config.exposure.withheldChannels);
-        return new Snapshot(config.enabled && config.exposure.enabled, config.exposure.filterInbound, policy, null);
+        return new Snapshot(config.exposureActive(), config.exposure.filterInbound, policy, null);
     }
 
     /** True when this packet must not leave the client at all. */
