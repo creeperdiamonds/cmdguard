@@ -66,6 +66,9 @@ public final class ExposureGuard {
      */
     public interface ConnectionInit {
         void cmdguard$initExposure(String serverKey);
+
+        /** The snapshot frozen for this connection, never null -- globals-only if uninitialised. */
+        Snapshot cmdguard$snapshot();
     }
 
     /**
@@ -88,7 +91,21 @@ public final class ExposureGuard {
      *                    -- see that method's Javadoc for why.
      */
     public static void beginConnection(Connection connection, String serverKey) {
+        Minecraft client = Minecraft.getInstance();
         LEDGER.reset();
+        if (client == null || !client.isSameThread()) {
+            // Enforce the documented contract rather than trust the caller: reading Minecraft
+            // state (which serverKey was presumably computed from) off the client thread is
+            // exactly the stale-read defect this class's Javadoc warns about. Deliberately do
+            // NOT call cmdguard$initExposure here -- leaving the connection's snapshot field
+            // unset lets ConnectionMixin's own lazy fallback install globalsOnlySnapshot() on
+            // first use, which is strictly stricter than any per-server policy and safe from
+            // any thread.
+            CmdGuardClient.LOGGER.error(
+                    "[cmdguard] beginConnection called off the client thread; "
+                            + "leaving this connection on the globals-only fallback snapshot");
+            return;
+        }
         if (connection instanceof ConnectionInit init) {
             init.cmdguard$initExposure(serverKey);
         }

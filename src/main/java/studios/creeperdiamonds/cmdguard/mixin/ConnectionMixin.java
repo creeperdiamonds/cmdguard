@@ -81,7 +81,8 @@ public abstract class ConnectionMixin implements ExposureGuard.ConnectionInit {
      * because this field belongs to this Connection instance alone.
      */
     @Unique
-    private ExposureGuard.Snapshot cmdguard$snapshot() {
+    @Override
+    public ExposureGuard.Snapshot cmdguard$snapshot() {
         ExposureGuard.Snapshot snapshot = cmdguard$snapshot;
         if (snapshot == null) {
             snapshot = ExposureGuard.globalsOnlySnapshot();
