@@ -33,14 +33,33 @@ public final class CommandRoot {
      * "no root here". Nothing in the client passes null today; the guard is here because the
      * suggestion path reads its string off a packet, and a packet is a wider door than a
      * method parameter.
+     *
+     * <p><b>"Word" ends at any whitespace, not only at {@code ' '}.</b> This used to split on
+     * the space character alone, so {@code "msg\tSteve"} had the root {@code "msg\tsteve"} --
+     * one string that is plainly not a command root by any reading. Now that the same parser
+     * answers for both guards, one notion of "first word" is worth more than the old one's
+     * accidental strictness.
+     *
+     * <p>Recorded because it is a direction change and should not be rediscovered as a
+     * surprise: the old root {@code "msg\tsteve"} was on nobody's allowlist, so such input was
+     * blocked (typed command) and withheld (completion); the new root {@code "msg"} can be
+     * allowlisted, so it may now be let through. That is defensive-only ground in both
+     * directions. Whitespace inside a command cannot be produced by the paths that reach here
+     * -- Tab is the completion key, so a tab cannot be typed into a chat or command-block box
+     * -- and vanilla's own parser refuses it anyway: brigadier's {@code
+     * CommandDispatcher#parseNodes} reads the literal with {@code readUnquotedString} and then
+     * errors unless the next character is a space, so {@code /msg\tSteve} never executes on
+     * the server whichever root this returns.
      */
     public static String of(String command) {
         if (command == null) {
             return "";
         }
         String trimmed = command.startsWith("/") ? command.substring(1) : command;
-        int space = trimmed.indexOf(' ');
-        String root = space < 0 ? trimmed : trimmed.substring(0, space);
-        return root.toLowerCase(Locale.ROOT);
+        int end = 0;
+        while (end < trimmed.length() && !Character.isWhitespace(trimmed.charAt(end))) {
+            end++;
+        }
+        return trimmed.substring(0, end).toLowerCase(Locale.ROOT);
     }
 }
