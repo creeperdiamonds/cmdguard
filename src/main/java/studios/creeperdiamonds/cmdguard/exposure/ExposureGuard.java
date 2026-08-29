@@ -1,5 +1,7 @@
 package studios.creeperdiamonds.cmdguard.exposure;
 
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientPacketListener;
 import net.minecraft.network.Connection;
 import net.minecraft.network.protocol.Packet;
 import net.minecraft.network.protocol.common.ServerboundCustomPayloadPacket;
@@ -57,6 +59,22 @@ public final class ExposureGuard {
 
     public static ChannelLedger ledger() {
         return LEDGER;
+    }
+
+    /**
+     * The active connection's snapshot, or null when not connected.
+     *
+     * <p>Client-thread only. This walks the play listener to reach the connection, so it is
+     * for commands and screens -- never for the filtering path, which must use the snapshot
+     * held on its own {@link ConnectionInit}.
+     */
+    public static Snapshot currentSnapshot() {
+        Minecraft client = Minecraft.getInstance();
+        ClientPacketListener listener = client == null ? null : client.getConnection();
+        if (listener == null) {
+            return null;
+        }
+        return ((ConnectionInit) (Object) listener.getConnection()).cmdguard$snapshot();
     }
 
     /**
