@@ -165,6 +165,79 @@ rather than shipping a jar whose guard silently does nothing" overstates it: it 
 *game launch*. A green build is evidence of compilation and nothing more; every descriptor
 in this file was verified with `javap` against the mapped jar for exactly this reason.
 
+### Unguarded outbound path: `ServerboundSetCommandBlockPacket`
+
+**This is a gap in the command guard, not in the tab-completion guard, and it predates
+both.** Nobody had noticed it until the tab-completion review asked why command-block
+completions were being withheld for no protection gain. Recorded here rather than fixed:
+covering it is a separate decision, with its own trade-offs, and is deliberately *not*
+implemented.
+
+**What it carries.** Verified 2026-08-29 with `javap -p -c` over the Mojang-mapped 1.21.11
+merged jar — the same reading as everything else in this file:
+
+```
+net.minecraft.network.protocol.game.ServerboundSetCommandBlockPacket
+    public class ... implements Packet<ServerGamePacketListener>
+    private final net.minecraft.core.BlockPos pos;
+    private final java.lang.String command;      // FriendlyByteBuf.readUtf()
+    private final boolean trackOutput;
+    private final boolean conditional;
+    private final boolean automatic;
+    private final CommandBlockEntity$Mode mode;
+
+    public ServerboundSetCommandBlockPacket(BlockPos, String, CommandBlockEntity$Mode, boolean, boolean, boolean)
+```
+
+The `String` is the **whole command text**, not a prefix. `CommandBlockEditScreen`
+`#populateAndSendPacket` reads it straight off the edit box and sends it:
+
+```
+0: minecraft.getConnection()                       -> ClientPacketListener
+7: new ServerboundSetCommandBlockPacket
+12:   autoCommandBlock.getBlockPos()
+19:   commandEdit.getValue()                       // the full typed command
+26:   mode, isTrackOutput(), conditional, autoexec
+50: ClientPacketListener.send(Packet)
+```
+
+and `AbstractCommandBlockEditScreen#onDone` is `{ populateAndSendPacket(); ... }` — i.e.
+pressing **Done** sends it. `ServerboundSetCommandMinecartPacket` is the same hole in the
+minecart form: `private final int entity; private final java.lang.String command; private
+final boolean trackOutput;`, sent by `MinecartCommandBlockEditScreen#populateAndSendPacket`
+through the same `ClientPacketListener.send`.
+
+**Why it is not covered.** Nothing in `src` mentions either packet. `ConnectionMixin`'s
+outbound handler tests `packet instanceof ServerboundCommandSuggestionPacket` and nothing
+else, and `ClientPacketListenerMixin` hooks only `sendCommand` / `sendUnattendedCommand` —
+neither of which a command-block save goes through. Both packets do pass through
+`Connection#sendPacket`, so the choke point is already the right one; only the type test is
+missing.
+
+**The consequence for the tab-completion guard.** `AbstractCommandBlockEditScreen` is the
+only surface that produces slashless suggestion text, and the guard judges it — correctly
+and deliberately, since vanilla's own `handleCustomCommandSuggestions` treats that text as a
+command. But every vanilla command-block root (`setblock`, `execute`, `give`, `summon`) is
+off `GuardConfig.STARTER_ALLOWLIST`, so completions silently stop working in command blocks,
+**and withholding them protects nothing** — pressing Done ships the full text anyway. The
+parity argument that justifies the whole feature ("a suggestion request is judged by the
+same rule as the command it would become") does not hold on that one surface while this gap
+stands. The README says so plainly in its tab-completion section.
+
+**Not fixed by a screen-type exemption, and that was a choice.** Keying behaviour off a
+screen class is fragile — it can be reached from a subclass or another mod's screen, and it
+splits one rule into two — and one consistent rule is easier to reason about than a carve-out
+whose justification lives in a different file. The honest fix is to guard the packet; the
+honest interim is to say so.
+
+**If it is ever covered**, note the shape is not the same as the command guard's: the text
+arrives already complete and already committed by the user, there is no `clicked`
+distinction, and cancelling the packet leaves the command block holding its *old* command
+with the edit screen closed — a silent no-op the player has no reason to expect. That needs
+a chat message (`OutboundGuard#reportBlocked` is the precedent) and it needs deciding what
+"blocked" should mean for a block the player is standing in front of. Hence: a separate
+decision.
+
 ## Facts worth not re-litigating
 
 - `ClientCommandInternals.executeCommand` returns `true` (command NOT sent) whenever the

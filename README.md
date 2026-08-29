@@ -231,6 +231,20 @@ become**. There is no second list and no second policy to keep in sync.
   could ask to be consulted right at the root.
 - **Completions for allowlisted commands keep working.** `/msg <Tab>` still completes
   player names, because `msg` is on the allowlist.
+- **Command blocks lose their completions, and there you get nothing in return.** Two
+  boxes produce these requests: the chat box, and a command block's edit box. The edit
+  box's text has no leading `/`, and CmdGuard judges it by the same rule. Every vanilla
+  command-block root — `setblock`, `execute`, `give`, `summon` — is off the starter
+  allowlist, so block-state, item-id and selector completions stop working in command
+  blocks until you allow those roots (`/cmdguard allow setblock`, and so on). **Unlike
+  chat, withholding buys no protection there:** pressing **Done** sends
+  `ServerboundSetCommandBlockPacket`, which carries the whole command text, and CmdGuard
+  does not intercept that packet at all — so the server gets the full command anyway. The
+  parity argument that justifies this feature does not hold on that one surface. There is
+  still deliberately no exemption for the command-block screen: keying behaviour off a
+  screen class is fragile, and one rule you can reason about beats a carve-out. The
+  unguarded packet is recorded as a gap in [NOTES.md](NOTES.md), where it belongs — it is
+  a hole in the *command guard*, not something tab completion introduced.
 - **A blocked request is silent.** Tab simply shows nothing — there is no chat message,
   because a request goes out on every keystroke and a message per keystroke would bury
   your chat. The first time a given root is withheld, one line naming it and the
